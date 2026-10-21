@@ -1,0 +1,37 @@
+# Secrets: never commit (keep the *.example templates)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+keystore/
+keystores/
+
+# Foundry (generated)
+out/
+cache/
+broadcast/
+
+# Python / AI service
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Go backend
+*.exe
+*.test
+*.out
+
+# Node / Next.js frontend
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
