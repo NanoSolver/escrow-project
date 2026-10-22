@@ -119,6 +119,15 @@ func (c *Chain) callAddr(ctx context.Context, bc *bind.BoundContract, method str
 	return a, nil
 }
 
+// HasCode reports whether a contract exists at addr on the connected chain.
+func (c *Chain) HasCode(ctx context.Context, addr common.Address) (bool, error) {
+	code, err := c.client.CodeAt(ctx, addr, nil)
+	if err != nil {
+		return false, err
+	}
+	return len(code) > 0, nil
+}
+
 // Info reads the escrow's parties and live status straight from the chain.
 func (c *Chain) Info(ctx context.Context, addr common.Address) (EscrowInfo, error) {
 	var info EscrowInfo

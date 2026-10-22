@@ -57,6 +57,8 @@ func main() {
 		aiURL: envOr("AI_URL", "http://localhost:8000/evaluate"),
 	}
 
+	app.reconcile(ctx) // local chain only: drop DB rows whose contracts vanished with an Anvil restart
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "oracle": chain.addr.Hex()})

@@ -194,6 +194,7 @@ func (a *App) getEscrow(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"escrow": e}
 	if info, err := a.chain.Info(r.Context(), addr); err == nil {
 		resp["chain_status"] = statusName(info.Status)
+		resp["chain_freelancer"] = strings.ToLower(info.Freelancer.Hex())
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -237,17 +238,25 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// NOTE: this only checks the claimed address, it does not prove the caller owns it.
-	// Hackathon shortcut; production would verify an EIP-191 signed message.
-	if _, claimed, ok := parseAddress(body.Freelancer); !ok || claimed != e.FreelancerAddress {
-		writeErr(w, http.StatusForbidden, "only the escrow's freelancer may submit work")
-		return
-	}
-
 	// Money must actually be locked on-chain.
 	info, err := a.chain.Info(ctx, addr)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "could not read contract: "+err.Error())
+		return
+	}
+
+	// The DB row must describe THIS contract. After an Anvil restart, a stale row from the
+	// previous chain can share the same address; refuse instead of judging the wrong escrow.
+	if strings.ToLower(info.Freelancer.Hex()) != e.FreelancerAddress ||
+		strings.ToLower(info.Client.Hex()) != e.ClientAddress {
+		writeErr(w, http.StatusConflict, "the database record does not match the contract on-chain (stale escrow from a previous local chain?). Clear it and register the escrow again")
+		return
+	}
+
+	// NOTE: this only checks the claimed address, it does not prove the caller owns it.
+	// Hackathon shortcut; production would verify an EIP-191 signed message.
+	if _, claimed, ok := parseAddress(body.Freelancer); !ok || claimed != e.FreelancerAddress {
+		writeErr(w, http.StatusForbidden, "only the escrow's freelancer may submit work")
 		return
 	}
 	if info.Status != chainFunded {
