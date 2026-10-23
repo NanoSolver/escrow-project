@@ -15,10 +15,12 @@ contract DeployEscrow is Script {
         address oracle = vm.envAddress("ORACLE_ADDRESS");
         address freelancer = vm.envAddress("FREELANCER_ADDRESS");
         uint256 amount = vm.envUint("ESCROW_AMOUNT_WEI");
+        uint64 deadline = uint64(block.timestamp + vm.envOr("DEADLINE_DAYS", uint256(7)) * 1 days);
+        uint8 revisionLimit = uint8(vm.envOr("REVISION_LIMIT", uint256(2)));
 
         vm.startBroadcast();
         // msg.sender inside a broadcast is the broadcaster (set via --account / --private-key)
-        escrow = new Escrow(msg.sender, freelancer, oracle, amount);
+        escrow = new Escrow(msg.sender, freelancer, oracle, amount, deadline, revisionLimit);
         vm.stopBroadcast();
 
         console.log("Escrow deployed at:", address(escrow));

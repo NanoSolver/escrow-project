@@ -11,6 +11,8 @@ export type EscrowRecord = {
   ai_reasoning: string;
   tx_hash: string;
   last_error: string;
+  deadline_at: string;
+  revision_limit: number;
   created_at: string;
 };
 
@@ -19,6 +21,8 @@ export type SubmitResult = {
   reasoning: string;
   status: string;
   tx_hash: string;
+  revisions_used: number;
+  revision_limit: number;
 };
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -46,7 +50,14 @@ export const api = {
     }),
 
   get: (address: string) =>
-    req<{ escrow: EscrowRecord; chain_status?: string; chain_freelancer?: string }>(
+    req<{
+      escrow: EscrowRecord;
+      chain_status?: string;
+      chain_freelancer?: string;
+      chain_deadline?: number;
+      chain_revision_limit?: number;
+      chain_revisions_used?: number;
+    }>(
       `/escrows/${address}`,
     ),
 

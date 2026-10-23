@@ -24,8 +24,12 @@ const escrowABI = `[
  {"type":"function","name":"client","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
  {"type":"function","name":"freelancer","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
  {"type":"function","name":"oracleAddress","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
+ {"type":"function","name":"submissionDeadline","inputs":[],"outputs":[{"name":"","type":"uint64"}],"stateMutability":"view"},
+ {"type":"function","name":"revisionLimit","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
+ {"type":"function","name":"revisionsUsed","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
  {"type":"function","name":"releaseFunds","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
- {"type":"function","name":"refundClient","inputs":[],"outputs":[],"stateMutability":"nonpayable"}
+ {"type":"function","name":"refundClient","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"requestRevision","inputs":[],"outputs":[],"stateMutability":"nonpayable"}
 ]`
 
 // Mirrors the Solidity enum order.
@@ -62,8 +66,10 @@ type Chain struct {
 }
 
 type EscrowInfo struct {
-	Client, Freelancer, Oracle common.Address
-	Status                     uint8
+	Client, Freelancer, Oracle   common.Address
+	Status                       uint8
+	SubmissionDeadline           uint64
+	RevisionLimit, RevisionsUsed uint8
 }
 
 func NewChain(ctx context.Context, rpcURL, privateKeyHex string) (*Chain, error) {
@@ -158,12 +164,35 @@ func (c *Chain) Info(ctx context.Context, addr common.Address) (EscrowInfo, erro
 		return info, fmt.Errorf("status: unexpected type %T", v)
 	}
 	info.Status = s
+	// Keep the backend readable for contracts deployed before deadline support was added.
+	if v, callErr := c.callOne(ctx, bc, "submissionDeadline"); callErr == nil {
+		info.SubmissionDeadline, _ = v.(uint64)
+	}
+	if v, callErr := c.callOne(ctx, bc, "revisionLimit"); callErr == nil {
+		info.RevisionLimit, _ = v.(uint8)
+	}
+	if v, callErr := c.callOne(ctx, bc, "revisionsUsed"); callErr == nil {
+		info.RevisionsUsed, _ = v.(uint8)
+	}
 	return info, nil
+}
+
+// RequestRevision records an AI rejection while revisions remain; escrow funds stay locked.
+func (c *Chain) RequestRevision(ctx context.Context, addr common.Address) (string, error) {
+	return c.transact(ctx, addr, "requestRevision")
 }
 
 // Settle signs and sends releaseFunds() (release=true) or refundClient() (release=false)
 // with the oracle key, then waits until the transaction is mined.
 func (c *Chain) Settle(ctx context.Context, addr common.Address, release bool) (string, error) {
+	method := "refundClient"
+	if release {
+		method = "releaseFunds"
+	}
+	return c.transact(ctx, addr, method)
+}
+
+func (c *Chain) transact(ctx context.Context, addr common.Address, method string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -172,11 +201,6 @@ func (c *Chain) Settle(ctx context.Context, addr common.Address, release bool) (
 		return "", err
 	}
 	opts.Context = ctx
-
-	method := "refundClient"
-	if release {
-		method = "releaseFunds"
-	}
 
 	tx, err := c.bound(addr).Transact(opts, method)
 	if err != nil {

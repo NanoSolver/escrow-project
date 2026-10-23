@@ -19,7 +19,7 @@ contract EscrowTest is Test {
     event Refunded(address indexed client, uint256 amount);
 
     function setUp() public {
-        escrow = new Escrow(client, freelancer, oracle, AMOUNT);
+        escrow = new Escrow(client, freelancer, oracle, AMOUNT, uint64(block.timestamp + 7 days), 2);
         vm.deal(client, 10 ether);
     }
 
@@ -40,19 +40,19 @@ contract EscrowTest is Test {
 
     function test_constructorRejectsZeroAddress() public {
         vm.expectRevert(Escrow.ZeroAddress.selector);
-        new Escrow(address(0), freelancer, oracle, AMOUNT);
+        new Escrow(address(0), freelancer, oracle, AMOUNT, uint64(block.timestamp + 7 days), 2);
     }
 
     function test_constructorRejectsZeroAmount() public {
         vm.expectRevert(Escrow.ZeroAmount.selector);
-        new Escrow(client, freelancer, oracle, 0);
+        new Escrow(client, freelancer, oracle, 0, uint64(block.timestamp + 7 days), 2);
     }
 
     function test_constructorRejectsDuplicateRoles() public {
         vm.expectRevert(Escrow.DuplicateRoles.selector);
-        new Escrow(client, client, oracle, AMOUNT);
+        new Escrow(client, client, oracle, AMOUNT, uint64(block.timestamp + 7 days), 2);
         vm.expectRevert(Escrow.DuplicateRoles.selector);
-        new Escrow(client, freelancer, client, AMOUNT);
+        new Escrow(client, freelancer, client, AMOUNT, uint64(block.timestamp + 7 days), 2);
     }
 
     // ───────────── deposit() ─────────────
@@ -201,7 +201,7 @@ contract EscrowTest is Test {
     /// Escrow is generic over amount.
     function testFuzz_fullFlowAnyAmount(uint96 amt) public {
         vm.assume(amt > 0);
-        Escrow e = new Escrow(client, freelancer, oracle, amt);
+        Escrow e = new Escrow(client, freelancer, oracle, amt, uint64(block.timestamp + 7 days), 2);
         vm.deal(client, amt);
         vm.prank(client);
         e.deposit{value: amt}();

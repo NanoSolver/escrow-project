@@ -20,6 +20,8 @@ CREATE TABLE escrows (
     ai_reasoning       TEXT,
     tx_hash            TEXT,                   -- release/refund transaction
     last_error         TEXT,                   -- last AI/chain failure, for debugging
+    deadline_at        TIMESTAMPTZ,
+    revision_limit     INTEGER NOT NULL DEFAULT 0,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );

@@ -44,6 +44,12 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("db ping: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ`); err != nil {
+		log.Fatalf("db migration (deadline_at): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS revision_limit INTEGER NOT NULL DEFAULT 0`); err != nil {
+		log.Fatalf("db migration (revision_limit): %v", err)
+	}
 
 	chain, err := NewChain(ctx, mustEnv("RPC_URL"), mustEnv("ORACLE_PRIVATE_KEY"))
 	if err != nil {

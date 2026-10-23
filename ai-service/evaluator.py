@@ -8,7 +8,7 @@ import os
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 
@@ -56,12 +56,18 @@ def _get_agent() -> Agent:
     """Created lazily so importing this module never needs an API key."""
     global _agent
     if _agent is None:
+        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set; add it to ai-service/.env")
+
         model = OpenAIChatModel(
-            os.getenv("LLM_MODEL", "gpt-oss:120b"),  # hosted API uses the plain name, no "-cloud"
-            provider=OllamaProvider(
-                base_url=os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1"),
-                # strip(): a trailing space or newline from copy-paste makes Ollama answer 401
-                api_key=(os.getenv("OLLAMA_API_KEY") or "").strip() or None,
+            os.getenv("LLM_MODEL", "gemini-3.8-flash"),
+            provider=OpenAIProvider(
+                base_url=os.getenv(
+                    "GEMINI_BASE_URL",
+                    "https://generativelanguage.googleapis.com/v1beta/openai/",
+                ),
+                api_key=api_key,
             ),
         )
         _agent = Agent(

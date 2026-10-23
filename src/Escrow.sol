@@ -18,12 +18,16 @@ contract Escrow {
     address public immutable freelancer;
     address public immutable oracleAddress; // the Go backend's signing key
     uint256 public immutable amount;        // exact amount (in wei) that must be deposited
+    uint64 public immutable submissionDeadline; // unix timestamp; work must be approved before this time
+    uint8 public immutable revisionLimit;    // additional submissions allowed after rejection
+    uint8 public revisionsUsed;
     Status public status;
 
     // ──────────────────────────── Events ─────────────────────────────
     event Deposited(address indexed client, uint256 amount);
     event Released(address indexed freelancer, uint256 amount);
     event Refunded(address indexed client, uint256 amount);
+    event RevisionRequested(address indexed freelancer, uint8 revisionsUsed, uint8 revisionLimit);
 
     // ──────────────────────────── Errors ─────────────────────────────
     error ZeroAddress();
@@ -34,6 +38,10 @@ contract Escrow {
     error InvalidStatus(Status current);
     error IncorrectDeposit(uint256 sent, uint256 expected);
     error TransferFailed();
+    error DeadlinePassed();
+    error DeadlineNotReached();
+    error NoRevisionsRemaining();
+    error RevisionLimitTooHigh();
 
     // ─────────────────────────── Modifiers ───────────────────────────
     modifier onlyClient() {
@@ -53,11 +61,20 @@ contract Escrow {
     }
 
     // ────────────────────────── Constructor ──────────────────────────
-    constructor(address _client, address _freelancer, address _oracleAddress, uint256 _amount) {
+    constructor(
+        address _client,
+        address _freelancer,
+        address _oracleAddress,
+        uint256 _amount,
+        uint64 _submissionDeadline,
+        uint8 _revisionLimit
+    ) {
         if (_client == address(0) || _freelancer == address(0) || _oracleAddress == address(0)) {
             revert ZeroAddress();
         }
         if (_amount == 0) revert ZeroAmount();
+        if (_submissionDeadline <= block.timestamp) revert DeadlinePassed();
+        if (_revisionLimit > 10) revert RevisionLimitTooHigh();
         // Three distinct parties: the oracle must never be a party to the deal.
         if (_client == _freelancer || _client == _oracleAddress || _freelancer == _oracleAddress) {
             revert DuplicateRoles();
@@ -67,6 +84,8 @@ contract Escrow {
         freelancer = _freelancer;
         oracleAddress = _oracleAddress;
         amount = _amount;
+        submissionDeadline = _submissionDeadline;
+        revisionLimit = _revisionLimit;
         status = Status.Created;
     }
 
@@ -74,6 +93,7 @@ contract Escrow {
 
     /// @notice Client locks the agreed amount. Must match `amount` exactly.
     function deposit() external payable onlyClient inStatus(Status.Created) {
+        if (block.timestamp >= submissionDeadline) revert DeadlinePassed();
         if (msg.value != amount) revert IncorrectDeposit(msg.value, amount);
 
         status = Status.Funded;
@@ -82,6 +102,7 @@ contract Escrow {
 
     /// @notice Oracle approves the work: pay the freelancer.
     function releaseFunds() external onlyOracle inStatus(Status.Funded) {
+        if (block.timestamp >= submissionDeadline) revert DeadlinePassed();
         // Effects before interaction (checks-effects-interactions) blocks reentrancy:
         // a second call fails the inStatus check.
         status = Status.Released;
@@ -94,6 +115,24 @@ contract Escrow {
 
     /// @notice Oracle rejects the work: return the funds to the client.
     function refundClient() external onlyOracle inStatus(Status.Funded) {
+        _refundClient();
+    }
+
+    /// @notice Oracle rejects a submission while revisions remain; funds stay locked.
+    function requestRevision() external onlyOracle inStatus(Status.Funded) {
+        if (block.timestamp >= submissionDeadline) revert DeadlinePassed();
+        if (revisionsUsed >= revisionLimit) revert NoRevisionsRemaining();
+        revisionsUsed += 1;
+        emit RevisionRequested(freelancer, revisionsUsed, revisionLimit);
+    }
+
+    /// @notice Anyone can return stuck funds to the client after the submission deadline.
+    function refundAfterDeadline() external inStatus(Status.Funded) {
+        if (block.timestamp < submissionDeadline) revert DeadlineNotReached();
+        _refundClient();
+    }
+
+    function _refundClient() private {
         status = Status.Refunded;
 
         (bool ok, ) = payable(client).call{value: amount}("");

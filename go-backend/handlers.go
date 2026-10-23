@@ -72,17 +72,20 @@ type Escrow struct {
 	AIReasoning       string    `json:"ai_reasoning"`
 	TxHash            string    `json:"tx_hash"`
 	LastError         string    `json:"last_error"`
+	DeadlineAt        time.Time `json:"deadline_at"`
+	RevisionLimit     int       `json:"revision_limit"`
 	CreatedAt         time.Time `json:"created_at"`
 }
 
 const escrowCols = `contract_address, client_address, freelancer_address, initial_prompt,
 	COALESCE(submission_link, ''), status, ai_decision, COALESCE(ai_reasoning, ''),
-	COALESCE(tx_hash, ''), COALESCE(last_error, ''), created_at`
+	COALESCE(tx_hash, ''), COALESCE(last_error, ''), COALESCE(deadline_at, to_timestamp(0)), revision_limit, created_at`
 
 func scanEscrow(row pgx.Row) (Escrow, error) {
 	var e Escrow
 	err := row.Scan(&e.ContractAddress, &e.ClientAddress, &e.FreelancerAddress, &e.InitialPrompt,
-		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError, &e.CreatedAt)
+		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError,
+		&e.DeadlineAt, &e.RevisionLimit, &e.CreatedAt)
 	return e, err
 }
 
@@ -147,8 +150,9 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO escrows (contract_address, client_address, freelancer_address, initial_prompt, status)
-		 VALUES ($1, $2, $3, $4, $5)`, addrLower, client, freelancer, prompt, statusName(info.Status)); err != nil {
+		`INSERT INTO escrows (contract_address, client_address, freelancer_address, initial_prompt, status, deadline_at, revision_limit)
+		 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7)`, addrLower, client, freelancer, prompt,
+		statusName(info.Status), info.SubmissionDeadline, info.RevisionLimit); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			writeErr(w, http.StatusConflict, "escrow already registered")
@@ -193,8 +197,19 @@ func (a *App) getEscrow(w http.ResponseWriter, r *http.Request) {
 	// Attach the live on-chain status (the chain, not the DB, is the source of truth for money).
 	resp := map[string]any{"escrow": e}
 	if info, err := a.chain.Info(r.Context(), addr); err == nil {
-		resp["chain_status"] = statusName(info.Status)
+		chainStatus := statusName(info.Status)
+		resp["chain_status"] = chainStatus
 		resp["chain_freelancer"] = strings.ToLower(info.Freelancer.Hex())
+		resp["chain_deadline"] = info.SubmissionDeadline
+		resp["chain_revision_limit"] = info.RevisionLimit
+		resp["chain_revisions_used"] = info.RevisionsUsed
+		if (info.Status == chainReleased || info.Status == chainRefunded) && e.Status != chainStatus {
+			if _, updateErr := a.db.Exec(r.Context(),
+				`UPDATE escrows SET status = $2, updated_at = now() WHERE contract_address = $1`, addrLower, chainStatus); updateErr == nil {
+				e.Status = chainStatus
+				resp["escrow"] = e
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -263,6 +278,10 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, fmt.Sprintf("escrow is %s on-chain; it must be funded", statusName(info.Status)))
 		return
 	}
+	if info.SubmissionDeadline > 0 && uint64(time.Now().Unix()) >= info.SubmissionDeadline {
+		writeErr(w, http.StatusConflict, "the submission deadline has passed; anyone can trigger the on-chain refund to the client")
+		return
+	}
 
 	// Get the submission text (fetched from an allowlisted host, or sent inline).
 	submission := strings.TrimSpace(body.SubmissionText)
@@ -293,7 +312,11 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		log.Printf("submit failed for %s: %s", addrLower, msg)
 		bg, c := context.WithTimeout(context.Background(), 5*time.Second)
 		defer c()
-		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = 'funded', last_error = $2, updated_at = now() WHERE contract_address = $1`, addrLower, msg)
+		status := "funded"
+		if latest, readErr := a.chain.Info(bg, addr); readErr == nil {
+			status = statusName(latest.Status)
+		}
+		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = $2, last_error = $3, updated_at = now() WHERE contract_address = $1`, addrLower, status, msg)
 		writeErr(w, code, msg)
 	}
 
@@ -305,7 +328,14 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("AI VERDICT: decision=%v | %s", decision, reasoning)
 
-	txHash, err := a.chain.Settle(ctx, addr, decision)
+	var txHash string
+	if decision {
+		txHash, err = a.chain.Settle(ctx, addr, true)
+	} else if info.RevisionsUsed < info.RevisionLimit {
+		txHash, err = a.chain.RequestRevision(ctx, addr)
+	} else {
+		txHash, err = a.chain.Settle(ctx, addr, false)
+	}
 	if err != nil {
 		fail(http.StatusBadGateway, err.Error())
 		return
@@ -314,11 +344,13 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	finalStatus := "refunded"
 	if decision {
 		finalStatus = "released"
+	} else if info.RevisionsUsed < info.RevisionLimit {
+		finalStatus = "funded"
 	}
 	bg, c := context.WithTimeout(context.Background(), 5*time.Second)
 	defer c()
 	if _, err := a.db.Exec(bg,
-		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, tx_hash = $5, updated_at = now()
+		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, tx_hash = $5, last_error = NULL, updated_at = now()
 		 WHERE contract_address = $1`, addrLower, finalStatus, decision, reasoning, txHash); err != nil {
 		// The chain already settled; just report it loudly.
 		log.Printf("WARNING: settled on-chain (tx %s) but DB update failed: %v", txHash, err)
@@ -329,5 +361,13 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		"reasoning": reasoning,
 		"status":    finalStatus,
 		"tx_hash":   txHash,
+		"revisions_used": func() uint8 {
+			latest, readErr := a.chain.Info(ctx, addr)
+			if readErr != nil {
+				return info.RevisionsUsed
+			}
+			return latest.RevisionsUsed
+		}(),
+		"revision_limit": info.RevisionLimit,
 	})
 }

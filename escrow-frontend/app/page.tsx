@@ -69,6 +69,8 @@ function StepList({ steps }: { steps: Step[] }) {
 function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   const [freelancer, setFreelancer] = useState("");
   const [amount, setAmount] = useState("0.01");
+  const [deadlineDays, setDeadlineDays] = useState("7");
+  const [revisionLimit, setRevisionLimit] = useState("2");
   const [prompt, setPrompt] = useState(
     "Write a Python script that reverses a string. It must define reverse_string(s) that returns the reversed string and works for any input, including the empty string.",
   );
@@ -87,6 +89,14 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
     if (!isAddress(freelancer)) return setError("Enter a valid freelancer wallet address.");
     const eth = Number(amount);
     if (!(eth > 0)) return setError("Amount must be greater than 0.");
+    const days = Number(deadlineDays);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      return setError("Deadline must be between 1 and 365 whole days.");
+    }
+    const revisions = Number(revisionLimit);
+    if (!Number.isInteger(revisions) || revisions < 0 || revisions > 10) {
+      return setError("Choose between 0 and 10 allowed revisions.");
+    }
     if (!prompt.trim()) return setError("Describe what the freelancer must deliver.");
 
     setSteps(
@@ -112,10 +122,11 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       current = 1;
       setStep(1, "active");
       const value = parseEther(amount);
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + days * 24 * 60 * 60);
       const deployHash = await w.walletClient.deployContract({
         abi: escrowAbi,
         bytecode: escrowBytecode,
-        args: [w.account, freelancer as Address, oracle as Address, value],
+        args: [w.account, freelancer as Address, oracle as Address, value, deadline, revisions],
         account: w.account,
         chain: CHAIN,
       });
@@ -168,6 +179,13 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       <label>Amount ({CHAIN.nativeCurrency.symbol})</label>
       <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" />
 
+      <label>Submission deadline (days from now)</label>
+      <input value={deadlineDays} onChange={(e) => setDeadlineDays(e.target.value)} type="number" min="1" max="365" step="1" />
+
+      <label>Revision opportunities after rejection</label>
+      <input value={revisionLimit} onChange={(e) => setRevisionLimit(e.target.value)} type="number" min="0" max="10" step="1" />
+      <p className="muted small">After the deadline, anyone can trigger a refund to the client if the escrow is still funded.</p>
+
       <label>Requirement (what the AI will judge against)</label>
       <textarea rows={5} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
 
@@ -217,14 +235,27 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
 
   // Show who this escrow expects, straight from the chain, so a wrong wallet is obvious.
   const [expected, setExpected] = useState<string | null>(null);
+  const [dealInfo, setDealInfo] = useState<{
+    deadline?: number;
+    revisionsUsed?: number;
+    revisionLimit?: number;
+  } | null>(null);
   useEffect(() => {
     setExpected(null);
+    setDealInfo(null);
     if (!isAddress(escrow)) return;
     let stop = false;
     api
       .get(escrow)
       .then((d) => {
-        if (!stop) setExpected(d.chain_freelancer ?? d.escrow.freelancer_address);
+        if (!stop) {
+          setExpected(d.chain_freelancer ?? d.escrow.freelancer_address);
+          setDealInfo({
+            deadline: d.chain_deadline,
+            revisionsUsed: d.chain_revisions_used,
+            revisionLimit: d.chain_revision_limit,
+          });
+        }
       })
       .catch(() => {});
     return () => {
@@ -279,6 +310,13 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
           This escrow&apos;s freelancer: <code>{expected}</code>
         </p>
       )}
+      {dealInfo?.deadline ? (
+        <p className="muted small">
+          Deadline: {new Date(dealInfo.deadline * 1000).toLocaleString()}
+          {dealInfo.revisionLimit !== undefined &&
+            ` · revisions used: ${dealInfo.revisionsUsed ?? 0} of ${dealInfo.revisionLimit}`}
+        </p>
+      ) : null}
 
       <div className="toggle">
         <button className={mode === "text" ? "on" : ""} onClick={() => setMode("text")} disabled={busy}>
@@ -311,11 +349,16 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
       {error && <p className="error">{error}</p>}
 
       {result && (
-        <div className={`result ${result.decision ? "ok" : "bad"}`}>
+        <div className={`result ${result.decision ? "ok" : result.status === "funded" ? "" : "bad"}`}>
           <strong>
-            {result.decision ? "Approved: funds released to the freelancer" : "Rejected: funds refunded to the client"}
+            {result.decision
+              ? "Approved: funds released to the freelancer"
+              : result.status === "funded"
+                ? `Revision requested (${result.revisions_used} of ${result.revision_limit} used)`
+                : "Rejected: revision limit reached and funds refunded to the client"}
           </strong>
           <p>{result.reasoning}</p>
+          {result.status === "funded" && <p>The freelancer can revise the work and submit it again before the deadline.</p>}
           <p>
             Transaction: <TxLink hash={result.tx_hash} />
           </p>
@@ -329,8 +372,15 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
 
 function TrackView({ initial }: { initial: string }) {
   const [addr, setAddr] = useState(initial);
-  const [data, setData] = useState<{ escrow: EscrowRecord; chain_status?: string } | null>(null);
+  const [data, setData] = useState<{
+    escrow: EscrowRecord;
+    chain_status?: string;
+    chain_deadline?: number;
+    chain_revision_limit?: number;
+    chain_revisions_used?: number;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refundBusy, setRefundBusy] = useState(false);
 
   useEffect(() => setAddr(initial), [initial]);
 
@@ -363,6 +413,30 @@ function TrackView({ initial }: { initial: string }) {
   }, [addr]);
 
   const e = data?.escrow;
+  const deadline = data?.chain_deadline ?? (e?.deadline_at ? Math.floor(new Date(e.deadline_at).getTime() / 1000) : 0);
+  const expired = deadline > 0 && Date.now() / 1000 >= deadline;
+
+  async function refundAfterDeadline() {
+    setError(null);
+    setRefundBusy(true);
+    try {
+      if (!isAddress(addr)) throw new Error("Enter a valid escrow contract address.");
+      const w = await connect();
+      const hash = await w.walletClient.writeContract({
+        address: addr as Address,
+        abi: escrowAbi,
+        functionName: "refundAfterDeadline",
+        account: w.account,
+        chain: CHAIN,
+      });
+      await w.publicClient.waitForTransactionReceipt({ hash });
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setRefundBusy(false);
+    }
+  }
+
   return (
     <section className="card">
       <h2>Track escrow</h2>
@@ -377,6 +451,14 @@ function TrackView({ initial }: { initial: string }) {
           </dd>
           <dt>Backend status</dt>
           <dd>{e.status}</dd>
+          {deadline > 0 && <>
+            <dt>Submission deadline</dt>
+            <dd>{new Date(deadline * 1000).toLocaleString()}{expired ? " · passed" : ""}</dd>
+          </>}
+          {data?.chain_revision_limit !== undefined && <>
+            <dt>Revision opportunities</dt>
+            <dd>{data.chain_revisions_used ?? 0} of {data.chain_revision_limit} used</dd>
+          </>}
           <dt>Client</dt>
           <dd><code>{e.client_address}</code></dd>
           <dt>Freelancer</dt>
@@ -399,6 +481,12 @@ function TrackView({ initial }: { initial: string }) {
             <>
               <dt>Last error</dt>
               <dd className="error">{e.last_error}</dd>
+            </>
+          )}
+          {expired && data?.chain_status === "funded" && (
+            <>
+              <dt>Deadline refund</dt>
+              <dd><button onClick={refundAfterDeadline} disabled={refundBusy}>{refundBusy ? "Refunding…" : "Refund funds to client"}</button><p className="muted small">Anyone can submit this transaction; the contract sends the funds directly to the client.</p></dd>
             </>
           )}
         </dl>
