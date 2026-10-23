@@ -13,32 +13,32 @@ import (
 )
 
 type Verdict struct {
-	Decision  *bool  `json:"decision"` // pointer so a missing field is detected, not read as false
-	Reasoning string `json:"reasoning"`
+	Decision         *bool  `json:"decision"`
+	NeedsHumanReview bool   `json:"needs_human_review"`
+	Reasoning        string `json:"reasoning"`
 }
 
 const aiAttempts = 3
 
-// evaluate asks the FastAPI judge for a verdict. Anything other than a well-formed
-// {decision: bool, reasoning: string} is treated as a failure and retried. The contract is
-// only touched when this returns nil error, so a hallucinated reply can never move funds.
-func (a *App) evaluate(ctx context.Context, requirement, submission string) (bool, string, error) {
+// evaluate asks the FastAPI judge for a clear verdict or an explicit human-review request.
+// Malformed replies are retried, and the contract is only touched after a clear decision.
+func (a *App) evaluate(ctx context.Context, requirement, submission string) (Verdict, error) {
 	var lastErr error
 	for attempt := 1; attempt <= aiAttempts; attempt++ {
 		v, err := a.callAI(ctx, requirement, submission)
 		if err == nil {
-			return *v.Decision, v.Reasoning, nil
+			return v, nil
 		}
 		lastErr = err
 		log.Printf("AI attempt %d/%d failed: %v", attempt, aiAttempts, err)
 
 		select {
 		case <-ctx.Done():
-			return false, "", ctx.Err()
+			return Verdict{}, ctx.Err()
 		case <-time.After(time.Duration(attempt) * 2 * time.Second):
 		}
 	}
-	return false, "", fmt.Errorf("AI evaluation failed after %d attempts: %w", aiAttempts, lastErr)
+	return Verdict{}, fmt.Errorf("AI evaluation failed after %d attempts: %w", aiAttempts, lastErr)
 }
 
 func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdict, error) {
@@ -73,11 +73,11 @@ func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdi
 	if err := json.Unmarshal(body, &v); err != nil {
 		return Verdict{}, fmt.Errorf("invalid JSON from AI: %w", err)
 	}
-	if v.Decision == nil {
-		return Verdict{}, fmt.Errorf("AI reply missing 'decision'")
-	}
 	if strings.TrimSpace(v.Reasoning) == "" {
 		return Verdict{}, fmt.Errorf("AI reply missing 'reasoning'")
+	}
+	if v.NeedsHumanReview == (v.Decision != nil) {
+		return Verdict{}, fmt.Errorf("AI reply must provide either a clear decision or request human review")
 	}
 	return v, nil
 }

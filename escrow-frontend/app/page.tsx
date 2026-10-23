@@ -2,12 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { isAddress, parseEther, type Address, type EIP1193Provider } from "viem";
-import { api, type EscrowRecord, type SubmitResult } from "../lib/api";
+import { api, type EscrowRecord, type HumanReview, type SubmitResult } from "../lib/api";
 import { CHAIN, EXPLORER_TX } from "../lib/config";
 import { escrowAbi, escrowBytecode } from "../lib/escrow";
 import { connect } from "../lib/wallet";
 
-type Tab = "client" | "freelancer" | "track";
+type Tab = "client" | "freelancer" | "track" | "review";
 type StepState = "todo" | "active" | "done" | "error";
 type Step = { label: string; state: StepState };
 
@@ -171,7 +171,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   return (
     <section className="card">
       <h2>Create escrow</h2>
-      <p className="muted">Lock funds in a smart contract. They are released only if the AI judge approves the work.</p>
+      <p className="muted">Lock funds in a smart contract. The AI reviews the work, and unclear cases wait for a human reviewer.</p>
 
       <label>Freelancer wallet address</label>
       <input value={freelancer} onChange={(e) => setFreelancer(e.target.value.trim())} placeholder="0x…" />
@@ -348,7 +348,13 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
       )}
       {error && <p className="error">{error}</p>}
 
-      {result && (
+      {result && result.needs_human_review ? (
+        <div className="result">
+          <strong>Human review needed · funds remain in escrow</strong>
+          <p>{result.reasoning}</p>
+          <p>A reviewer will assess the submission. Check this escrow’s status in Track escrow.</p>
+        </div>
+      ) : result && (
         <div className={`result ${result.decision ? "ok" : result.status === "funded" ? "" : "bad"}`}>
           <strong>
             {result.decision
@@ -364,6 +370,74 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
           </p>
         </div>
       )}
+    </section>
+  );
+}
+
+function HumanReviewView() {
+  const [token, setToken] = useState("");
+  const [reviews, setReviews] = useState<HumanReview[]>([]);
+  const [reasons, setReasons] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function refresh() {
+    setError(null);
+    try {
+      const data = await api.reviews(token);
+      setReviews(data.reviews);
+      setMessage(null);
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  }
+
+  async function decide(address: string, decision: boolean) {
+    const reasoning = reasons[address]?.trim() ?? "";
+    if (!reasoning) {
+      setError("Add a short explanation for the human decision.");
+      return;
+    }
+    setBusy(address);
+    setError(null);
+    try {
+      const result = await api.decideReview(address, token, decision, reasoning);
+      setMessage(`Review recorded: ${result.status}.`);
+      setReviews((items) => items.filter((item) => item.contract_address !== address));
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="card">
+      <h2>Human review queue</h2>
+      <p className="muted">Cases the AI could not judge clearly stay funded until a reviewer decides.</p>
+      <label>Reviewer access token</label>
+      <input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="HUMAN_REVIEW_TOKEN" />
+      <button onClick={refresh} disabled={!token || busy !== null}>Load pending reviews</button>
+      {message && <p className="result ok">{message}</p>}
+      {error && <p className="error">{error}</p>}
+      {reviews.length === 0 && !error && <p className="muted">No pending cases loaded.</p>}
+      {reviews.map((review) => (
+        <article className="review-item" key={review.contract_address}>
+          <h3>Escrow <code>{shortAddr(review.contract_address)}</code></h3>
+          <p><strong>Requirement</strong><br />{review.requirement}</p>
+          <p><strong>AI explanation</strong><br />{review.ai_reasoning}</p>
+          {review.submission_link !== "inline-text" && <p><strong>Submission link</strong><br /><a href={review.submission_link} target="_blank" rel="noreferrer">{review.submission_link}</a></p>}
+          <details><summary>View submitted work</summary><pre className="review-submission">{review.submission}</pre></details>
+          <label>Why is this your decision?</label>
+          <textarea rows={3} value={reasons[review.contract_address] ?? ""} onChange={(event) => setReasons((state) => ({ ...state, [review.contract_address]: event.target.value }))} />
+          <div className="toggle">
+            <button onClick={() => decide(review.contract_address, true)} disabled={busy !== null}>{busy === review.contract_address ? "Settling…" : "Approve and release"}</button>
+            <button onClick={() => decide(review.contract_address, false)} disabled={busy !== null}>{busy === review.contract_address ? "Settling…" : "Reject / request revision"}</button>
+          </div>
+          <p className="muted small">If no revisions remain, rejection refunds the client. After the deadline, the contract only allows a refund.</p>
+        </article>
+      ))}
     </section>
   );
 }
@@ -471,6 +545,12 @@ function TrackView({ initial }: { initial: string }) {
               <dd>{e.ai_reasoning}</dd>
             </>
           )}
+          {e.human_decision !== null && (
+            <>
+              <dt>Human review</dt>
+              <dd>{e.human_decision ? "Approved" : "Rejected"}{e.human_reasoning ? ` · ${e.human_reasoning}` : ""}</dd>
+            </>
+          )}
           {e.tx_hash && (
             <>
               <dt>Settlement tx</dt>
@@ -536,7 +616,7 @@ export default function Home() {
       <header>
         <div>
           <h1>AI Escrow</h1>
-          <span className="muted small">Funds locked on-chain · released by AI verdict · {CHAIN.name}</span>
+          <span className="muted small">Funds locked on-chain · AI review with human fallback · {CHAIN.name}</span>
         </div>
         <button className="ghost" onClick={connectWallet}>
           {account ? shortAddr(account) : "Connect MetaMask"}
@@ -555,6 +635,7 @@ export default function Home() {
             ["client", "I'm the client"],
             ["freelancer", "I'm the freelancer"],
             ["track", "Track escrow"],
+            ["review", "Human review"],
           ] as const
         ).map(([id, label]) => (
           <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>
@@ -566,6 +647,7 @@ export default function Home() {
       {tab === "client" && <ClientView onAccount={setAccount} />}
       {tab === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
       {tab === "track" && <TrackView initial={prefill} />}
+      {tab === "review" && <HumanReviewView />}
     </main>
   );
 }

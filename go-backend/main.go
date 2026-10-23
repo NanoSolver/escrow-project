@@ -12,9 +12,10 @@ import (
 )
 
 type App struct {
-	db    *pgxpool.Pool
-	chain *Chain
-	aiURL string
+	db               *pgxpool.Pool
+	chain            *Chain
+	aiURL            string
+	humanReviewToken string
 }
 
 func mustEnv(k string) string {
@@ -50,6 +51,15 @@ func main() {
 	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS revision_limit INTEGER NOT NULL DEFAULT 0`); err != nil {
 		log.Fatalf("db migration (revision_limit): %v", err)
 	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submission_text TEXT`); err != nil {
+		log.Fatalf("db migration (submission_text): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS human_decision BOOLEAN, ADD COLUMN IF NOT EXISTS human_reasoning TEXT`); err != nil {
+		log.Fatalf("db migration (human decision): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP CONSTRAINT IF EXISTS escrows_status_check, ADD CONSTRAINT escrows_status_check CHECK (status IN ('created', 'funded', 'evaluating', 'pending_review', 'released', 'refunded'))`); err != nil {
+		log.Fatalf("db migration (pending_review status): %v", err)
+	}
 
 	chain, err := NewChain(ctx, mustEnv("RPC_URL"), mustEnv("ORACLE_PRIVATE_KEY"))
 	if err != nil {
@@ -58,9 +68,10 @@ func main() {
 	log.Printf("oracle address: %s | chain id: %s", chain.addr.Hex(), chain.chainID)
 
 	app := &App{
-		db:    pool,
-		chain: chain,
-		aiURL: envOr("AI_URL", "http://localhost:8000/evaluate"),
+		db:               pool,
+		chain:            chain,
+		aiURL:            envOr("AI_URL", "http://localhost:8000/evaluate"),
+		humanReviewToken: envOr("HUMAN_REVIEW_TOKEN", ""),
 	}
 
 	app.reconcile(ctx) // local chain only: drop DB rows whose contracts vanished with an Anvil restart
@@ -72,6 +83,8 @@ func main() {
 	mux.HandleFunc("POST /escrows", app.createEscrow)
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)
 	mux.HandleFunc("POST /escrows/{address}/submit", app.submitWork)
+	mux.HandleFunc("GET /reviews", app.listReviews)
+	mux.HandleFunc("POST /reviews/{address}/decision", app.decideReview)
 
 	srv := &http.Server{
 		Addr:              ":" + envOr("PORT", "8080"),

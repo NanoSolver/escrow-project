@@ -74,6 +74,11 @@ button.ghost { margin: 0; background: transparent; border: 1px solid var(--borde
 .result.bad { border-color: var(--bad); background: rgba(248, 81, 73, 0.1); }
 .result p { margin: 8px 0 0; }
 
+.review-item { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
+.review-item h3 { margin: 0 0 12px; }
+.review-item p { overflow-wrap: anywhere; }
+.review-submission { max-height: 320px; overflow: auto; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .steps { list-style: none; padding: 0; margin: 16px 0 0; }
 .step { padding: 4px 0; color: var(--muted); }
 .step.active { color: var(--text); }

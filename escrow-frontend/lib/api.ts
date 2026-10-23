@@ -9,6 +9,8 @@ export type EscrowRecord = {
   status: string;
   ai_decision: boolean | null;
   ai_reasoning: string;
+  human_decision: boolean | null;
+  human_reasoning: string;
   tx_hash: string;
   last_error: string;
   deadline_at: string;
@@ -17,7 +19,8 @@ export type EscrowRecord = {
 };
 
 export type SubmitResult = {
-  decision: boolean;
+  decision: boolean | null;
+  needs_human_review?: boolean;
   reasoning: string;
   status: string;
   tx_hash: string;
@@ -30,7 +33,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${BACKEND_URL}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...init?.headers },
     });
   } catch {
     throw new Error(`Cannot reach the backend at ${BACKEND_URL}. Is the Go server running?`);
@@ -69,4 +72,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  reviews: (token: string) =>
+    req<{ reviews: HumanReview[] }>("/reviews", {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+
+  decideReview: (address: string, token: string, decision: boolean, reasoning: string) =>
+    req<SubmitResult>(`/reviews/${address}/decision`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ decision, reasoning }),
+    }),
+};
+
+export type HumanReview = {
+  contract_address: string;
+  client_address: string;
+  freelancer_address: string;
+  requirement: string;
+  submission_link: string;
+  submission: string;
+  ai_reasoning: string;
+  submitted_at: string;
 };

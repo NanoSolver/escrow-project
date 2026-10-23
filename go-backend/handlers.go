@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,7 +33,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -70,6 +71,8 @@ type Escrow struct {
 	Status            string    `json:"status"`
 	AIDecision        *bool     `json:"ai_decision"`
 	AIReasoning       string    `json:"ai_reasoning"`
+	HumanDecision     *bool     `json:"human_decision"`
+	HumanReasoning    string    `json:"human_reasoning"`
 	TxHash            string    `json:"tx_hash"`
 	LastError         string    `json:"last_error"`
 	DeadlineAt        time.Time `json:"deadline_at"`
@@ -78,13 +81,13 @@ type Escrow struct {
 }
 
 const escrowCols = `contract_address, client_address, freelancer_address, initial_prompt,
-	COALESCE(submission_link, ''), status, ai_decision, COALESCE(ai_reasoning, ''),
+	COALESCE(submission_link, ''), status, ai_decision, COALESCE(ai_reasoning, ''), human_decision, COALESCE(human_reasoning, ''),
 	COALESCE(tx_hash, ''), COALESCE(last_error, ''), COALESCE(deadline_at, to_timestamp(0)), revision_limit, created_at`
 
 func scanEscrow(row pgx.Row) (Escrow, error) {
 	var e Escrow
 	err := row.Scan(&e.ContractAddress, &e.ClientAddress, &e.FreelancerAddress, &e.InitialPrompt,
-		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError,
+		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.HumanDecision, &e.HumanReasoning, &e.TxHash, &e.LastError,
 		&e.DeadlineAt, &e.RevisionLimit, &e.CreatedAt)
 	return e, err
 }
@@ -296,8 +299,10 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 
 	// Atomically claim the escrow so two concurrent submits can't both trigger a payout.
 	tag, err := a.db.Exec(ctx,
-		`UPDATE escrows SET status = 'evaluating', submission_link = $2, last_error = NULL, updated_at = now()
-		 WHERE contract_address = $1 AND status IN ('created', 'funded')`, addrLower, link)
+		`UPDATE escrows SET status = 'evaluating', submission_link = $2, submission_text = $3,
+		 ai_decision = NULL, ai_reasoning = NULL, human_decision = NULL, human_reasoning = NULL,
+		 last_error = NULL, updated_at = now()
+		 WHERE contract_address = $1 AND status IN ('created', 'funded')`, addrLower, link, submission)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
@@ -316,16 +321,31 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		if latest, readErr := a.chain.Info(bg, addr); readErr == nil {
 			status = statusName(latest.Status)
 		}
-		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = $2, last_error = $3, updated_at = now() WHERE contract_address = $1`, addrLower, status, msg)
+		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = $2, submission_text = NULL, last_error = $3, updated_at = now() WHERE contract_address = $1`, addrLower, status, msg)
 		writeErr(w, code, msg)
 	}
 
 	log.Printf("evaluating submission for %s ...", addrLower)
-	decision, reasoning, err := a.evaluate(ctx, e.InitialPrompt, submission)
+	verdict, err := a.evaluate(ctx, e.InitialPrompt, submission)
 	if err != nil {
 		fail(http.StatusBadGateway, err.Error()) // contract untouched
 		return
 	}
+	if verdict.NeedsHumanReview {
+		if _, err := a.db.Exec(ctx,
+			`UPDATE escrows SET status = 'pending_review', ai_decision = NULL, ai_reasoning = $2, last_error = NULL, updated_at = now()
+			 WHERE contract_address = $1`, addrLower, verdict.Reasoning); err != nil {
+			fail(http.StatusInternalServerError, "could not save human review request")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"decision": nil, "needs_human_review": true, "reasoning": verdict.Reasoning,
+			"status": "pending_review", "tx_hash": "", "revision_limit": info.RevisionLimit,
+		})
+		return
+	}
+	decision := *verdict.Decision
+	reasoning := verdict.Reasoning
 	log.Printf("AI VERDICT: decision=%v | %s", decision, reasoning)
 
 	var txHash string
@@ -350,7 +370,8 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	bg, c := context.WithTimeout(context.Background(), 5*time.Second)
 	defer c()
 	if _, err := a.db.Exec(bg,
-		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, tx_hash = $5, last_error = NULL, updated_at = now()
+		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, submission_text = NULL,
+		 tx_hash = $5, last_error = NULL, updated_at = now()
 		 WHERE contract_address = $1`, addrLower, finalStatus, decision, reasoning, txHash); err != nil {
 		// The chain already settled; just report it loudly.
 		log.Printf("WARNING: settled on-chain (tx %s) but DB update failed: %v", txHash, err)
@@ -370,4 +391,145 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		}(),
 		"revision_limit": info.RevisionLimit,
 	})
+}
+
+func (a *App) authorizeReviewer(w http.ResponseWriter, r *http.Request) bool {
+	if a.humanReviewToken == "" {
+		writeErr(w, http.StatusServiceUnavailable, "human review is disabled; configure HUMAN_REVIEW_TOKEN")
+		return false
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if len(token) != len(a.humanReviewToken) || subtle.ConstantTimeCompare([]byte(token), []byte(a.humanReviewToken)) != 1 {
+		writeErr(w, http.StatusUnauthorized, "reviewer token is missing or invalid")
+		return false
+	}
+	return true
+}
+
+func (a *App) listReviews(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeReviewer(w, r) {
+		return
+	}
+	rows, err := a.db.Query(r.Context(), `SELECT contract_address, client_address, freelancer_address,
+		initial_prompt, COALESCE(submission_link, ''), COALESCE(submission_text, ''),
+		COALESCE(ai_reasoning, ''), updated_at FROM escrows WHERE status = 'pending_review' ORDER BY updated_at`)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not load review queue")
+		return
+	}
+	defer rows.Close()
+	type reviewItem struct {
+		Address        string    `json:"contract_address"`
+		Client         string    `json:"client_address"`
+		Freelancer     string    `json:"freelancer_address"`
+		Requirement    string    `json:"requirement"`
+		SubmissionLink string    `json:"submission_link"`
+		Submission     string    `json:"submission"`
+		AIReasoning    string    `json:"ai_reasoning"`
+		SubmittedAt    time.Time `json:"submitted_at"`
+	}
+	items := make([]reviewItem, 0)
+	for rows.Next() {
+		var item reviewItem
+		if err := rows.Scan(&item.Address, &item.Client, &item.Freelancer, &item.Requirement,
+			&item.SubmissionLink, &item.Submission, &item.AIReasoning, &item.SubmittedAt); err != nil {
+			writeErr(w, http.StatusInternalServerError, "could not read review queue")
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not read review queue")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reviews": items})
+}
+
+func (a *App) decideReview(w http.ResponseWriter, r *http.Request) {
+	if !a.authorizeReviewer(w, r) {
+		return
+	}
+	addr, addrLower, ok := parseAddress(r.PathValue("address"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid escrow address")
+		return
+	}
+	var body struct {
+		Decision  *bool  `json:"decision"`
+		Reasoning string `json:"reasoning"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if body.Decision == nil || strings.TrimSpace(body.Reasoning) == "" || len(body.Reasoning) > 1000 {
+		writeErr(w, http.StatusBadRequest, "provide a decision and a 1-1000 character explanation")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+
+	var client, freelancer string
+	err := a.db.QueryRow(ctx, `UPDATE escrows SET status = 'evaluating', updated_at = now()
+		WHERE contract_address = $1 AND status = 'pending_review'
+		RETURNING client_address, freelancer_address`, addrLower).Scan(&client, &freelancer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeErr(w, http.StatusConflict, "review is no longer pending")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "could not claim review")
+		return
+	}
+	resetPending := func(msg string) {
+		bg, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = 'pending_review', last_error = $2, updated_at = now() WHERE contract_address = $1 AND status = 'evaluating'`, addrLower, msg)
+		writeErr(w, http.StatusBadGateway, msg)
+	}
+	info, err := a.chain.Info(ctx, addr)
+	if err != nil {
+		resetPending("could not read contract: " + err.Error())
+		return
+	}
+	if strings.ToLower(info.Client.Hex()) != client || strings.ToLower(info.Freelancer.Hex()) != freelancer {
+		resetPending("database record does not match the on-chain contract")
+		return
+	}
+	if info.Status != chainFunded {
+		resetPending("escrow is no longer funded on-chain")
+		return
+	}
+	if info.SubmissionDeadline > 0 && uint64(time.Now().Unix()) >= info.SubmissionDeadline {
+		resetPending("submission deadline has passed; trigger the on-chain deadline refund")
+		return
+	}
+	decision := *body.Decision
+	var txHash string
+	if decision {
+		txHash, err = a.chain.Settle(ctx, addr, true)
+	} else if info.RevisionsUsed < info.RevisionLimit {
+		txHash, err = a.chain.RequestRevision(ctx, addr)
+	} else {
+		txHash, err = a.chain.Settle(ctx, addr, false)
+	}
+	if err != nil {
+		resetPending(err.Error())
+		return
+	}
+	finalStatus := "refunded"
+	if decision {
+		finalStatus = "released"
+	} else if info.RevisionsUsed < info.RevisionLimit {
+		finalStatus = "funded"
+	}
+	_, err = a.db.Exec(ctx, `UPDATE escrows SET status = $2, human_decision = $3,
+		human_reasoning = $4, submission_text = NULL, tx_hash = $5, last_error = NULL, updated_at = now() WHERE contract_address = $1`,
+		addrLower, finalStatus, decision, strings.TrimSpace(body.Reasoning), txHash)
+	if err != nil {
+		log.Printf("WARNING: human review settled on-chain (tx %s) but DB update failed: %v", txHash, err)
+		writeErr(w, http.StatusInternalServerError, "settled on-chain but could not save the review result")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"decision": decision, "reasoning": strings.TrimSpace(body.Reasoning),
+		"status": finalStatus, "tx_hash": txHash})
 }
