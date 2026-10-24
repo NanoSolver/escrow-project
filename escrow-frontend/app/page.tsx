@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { isAddress, parseEther, type Address, type EIP1193Provider } from "viem";
-import { api, type EscrowRecord, type SubmitResult } from "../lib/api";
-import { CHAIN, EXPLORER_TX } from "../lib/config";
+import { formatEther, isAddress, parseEther, zeroAddress, type Address, type EIP1193Provider } from "viem";
+import { api, type OpenJob, type SubmitResult } from "../lib/api";
+import { CHAIN, EXPLORER_TX, SETTLEMENT_GRACE_SECONDS } from "../lib/config";
 import { escrowAbi, escrowBytecode } from "../lib/escrow";
 import { connect } from "../lib/wallet";
 
@@ -19,20 +19,19 @@ function errMsg(e: unknown): string {
 function walletError(e: unknown): string {
   const x = e as { code?: number; message?: string; shortMessage?: string };
   if (x?.code === 4001 || /user rejected|request rejected/i.test(x?.message ?? "")) {
-    return "MetaMask sign-in was canceled. Click Continue again, then approve the one-time signature request; it is not a transaction and costs no gas.";
+    return "MetaMask sign-in was canceled. Retry and approve the one-time signature; it is not a transaction and costs no gas.";
   }
   return errMsg(e);
 }
 
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-// The API does not expose its internal phase, so do not claim a chain
-// confirmation is pending while the AI review may still be running.
+// Backend does not expose its phase, so avoid claiming a chain confirmation is pending too early.
 const AI_STAGES = [
   "Fetching your submission…",
   "Processing AI evaluation…",
   "The AI is reviewing the work against the requirement…",
-  "The AI provider is taking longer than usual; this can take up to about 90 seconds…",
+  "The AI provider is taking longer than usual; this may take up to about 90 seconds…",
 ];
 
 function useStage(active: boolean) {
@@ -73,12 +72,44 @@ function StepList({ steps }: { steps: Step[] }) {
   );
 }
 
+/** Turns the contract's custom errors into sentences a freelancer can act on. */
+function acceptErrMsg(e: unknown): string {
+  const m = errMsg(e);
+  if (m.includes("AlreadyAssigned")) return "Someone else accepted this job first.";
+  if (m.includes("DuplicateRoles"))
+    return "The client (or the oracle) cannot accept their own job. Switch MetaMask to a freelancer account.";
+  if (m.includes("DeadlinePassed")) return "This job's deadline has passed, so it can no longer be accepted.";
+  if (m.includes("InvalidStatus"))
+    return "This job is not open for acceptance (it must be funded and not yet settled).";
+  return m;
+}
+
+/** The freelancer's own wallet claims an open job on-chain, then the backend learns who got it. */
+async function acceptOnChain(addr: Address): Promise<Address> {
+  const w = await connect();
+  const hash = await w.walletClient.writeContract({
+    address: addr,
+    abi: escrowAbi,
+    functionName: "acceptJob",
+    account: w.account,
+    chain: CHAIN,
+  });
+  await w.publicClient.waitForTransactionReceipt({ hash });
+  await api.get(addr); // the backend reads the chain and records the new freelancer
+  return w.account;
+}
+
 /* ───────────────────────────── Client ───────────────────────────── */
 
+const UNIT_SECONDS = { minutes: 60, hours: 3600, days: 86400 } as const;
+type Unit = keyof typeof UNIT_SECONDS;
+
 function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
+  const [assignment, setAssignment] = useState<"assigned" | "open">("assigned");
   const [freelancer, setFreelancer] = useState("");
   const [amount, setAmount] = useState("0.01");
-  const [deadlineDays, setDeadlineDays] = useState("7");
+  const [deadlineValue, setDeadlineValue] = useState("7");
+  const [deadlineUnit, setDeadlineUnit] = useState<Unit>("days");
   const [revisionLimit, setRevisionLimit] = useState("2");
   const [prompt, setPrompt] = useState(
     "Write a Python script that reverses a string. It must define reverse_string(s) that returns the reversed string and works for any input, including the empty string.",
@@ -89,29 +120,30 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   const [created, setCreated] = useState<string | null>(null);
   const [parties, setParties] = useState<{ client: string; freelancer: string } | null>(null);
 
-  const setStep = (i: number, state: StepState) =>
-    setSteps((s) => s.map((x, j) => (j === i ? { ...x, state } : x)));
+  const setStep = (i: number, state: StepState) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, state } : x)));
 
   async function create() {
     setError(null);
     setCreated(null);
-    if (!isAddress(freelancer)) return setError("Enter a valid freelancer wallet address.");
+    const isOpen = assignment === "open";
+    if (!isOpen && !isAddress(freelancer)) return setError("Enter a valid freelancer wallet address.");
     const eth = Number(amount);
     if (!(eth > 0)) return setError("Amount must be greater than 0.");
-    const days = Number(deadlineDays);
-    if (!Number.isInteger(days) || days < 1 || days > 365) {
-      return setError("Deadline must be between 1 and 365 whole days.");
+    const deadlineSeconds = Number(deadlineValue) * UNIT_SECONDS[deadlineUnit];
+    if (!(deadlineSeconds >= 300 && deadlineSeconds <= 365 * 86400)) {
+      return setError("Deadline must be between 5 minutes and 365 days.");
     }
     const revisions = Number(revisionLimit);
     if (!Number.isInteger(revisions) || revisions < 0 || revisions > 10) {
-      return setError("Choose between 0 and 10 allowed revisions.");
+      return setError("Revisions must be a whole number from 0 to 10.");
     }
     if (!prompt.trim()) return setError("Describe what the freelancer must deliver.");
 
     setSteps(
-      ["Connect MetaMask", "Deploy escrow contract", "Deposit funds", "Register with backend"].map(
-        (label) => ({ label, state: "todo" as StepState }),
-      ),
+      ["Connect MetaMask", "Deploy escrow contract", "Deposit funds", "Register with backend"].map((label) => ({
+        label,
+        state: "todo" as StepState,
+      })),
     );
     setBusy(true);
     let current = 0;
@@ -119,23 +151,33 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       setStep(0, "active");
       const w = await connect();
       onAccount(w.account);
-      if (w.account.toLowerCase() === freelancer.toLowerCase()) {
+      if (!isOpen && w.account.toLowerCase() === freelancer.toLowerCase()) {
         throw new Error(
           "MetaMask is currently on the same address you entered as freelancer. Switch MetaMask to the CLIENT account (and connect it to this site) first.",
         );
       }
-      setParties({ client: w.account, freelancer });
+      setParties({ client: w.account, freelancer: isOpen ? zeroAddress : freelancer });
       const { oracle } = await api.health(); // oracle = the Go backend's signing address
       setStep(0, "done");
 
       current = 1;
       setStep(1, "active");
       const value = parseEther(amount);
-      const deadline = BigInt(Math.floor(Date.now() / 1000) + days * 24 * 60 * 60);
+      // Base the deadline on the chain's clock, so a skewed PC clock can't break it.
+      const latestBlock = await w.publicClient.getBlock();
+      const deadline = latestBlock.timestamp + BigInt(Math.round(deadlineSeconds));
       const deployHash = await w.walletClient.deployContract({
         abi: escrowAbi,
         bytecode: escrowBytecode,
-        args: [w.account, freelancer as Address, oracle as Address, value, deadline, revisions],
+        // address(0) as the freelancer makes this an open job: the first wallet to accept it wins.
+        args: [
+          w.account,
+          isOpen ? zeroAddress : (freelancer as Address),
+          oracle as Address,
+          value,
+          deadline,
+          revisions,
+        ],
         account: w.account,
         chain: CHAIN,
       });
@@ -180,20 +222,56 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   return (
     <section className="card">
       <h2>Create escrow</h2>
-      <p className="muted">Lock funds in a smart contract. The AI reviews submitted work against your requirement.</p>
+      <p className="muted">Lock funds in a smart contract. They are released only if the AI judge approves the work.</p>
 
-      <label>Freelancer wallet address</label>
-      <input value={freelancer} onChange={(e) => setFreelancer(e.target.value.trim())} placeholder="0x…" />
+      <label>Who can take this job?</label>
+      <div className="toggle">
+        <button
+          className={assignment === "assigned" ? "on" : ""}
+          onClick={() => setAssignment("assigned")}
+          disabled={busy}
+        >
+          A freelancer I choose
+        </button>
+        <button className={assignment === "open" ? "on" : ""} onClick={() => setAssignment("open")} disabled={busy}>
+          Open to anyone
+        </button>
+      </div>
 
-      <label>Amount ({CHAIN.nativeCurrency.symbol})</label>
+      {assignment === "assigned" ? (
+        <>
+          <label>Freelancer wallet address</label>
+          <input value={freelancer} onChange={(e) => setFreelancer(e.target.value.trim())} placeholder="0x…" />
+        </>
+      ) : (
+        <p className="muted small">
+          Your job is listed on the Open jobs board once it is funded. The first freelancer to accept it is the only one
+          who can submit work and be paid, at the price below. Nobody can accept after the deadline.
+        </p>
+      )}
+
+      <label>
+        {assignment === "open" ? "Price" : "Amount"} ({CHAIN.nativeCurrency.symbol})
+      </label>
       <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" />
 
-      <label>Submission deadline (days from now)</label>
-      <input value={deadlineDays} onChange={(e) => setDeadlineDays(e.target.value)} type="number" min="1" max="365" step="1" />
+      <label>Submission deadline (from now)</label>
+      <div className="row">
+        <input value={deadlineValue} onChange={(e) => setDeadlineValue(e.target.value)} inputMode="decimal" />
+        <select value={deadlineUnit} onChange={(e) => setDeadlineUnit(e.target.value as Unit)}>
+          <option value="minutes">minutes</option>
+          <option value="hours">hours</option>
+          <option value="days">days</option>
+        </select>
+      </div>
 
-      <label>Revision opportunities after rejection</label>
-      <input value={revisionLimit} onChange={(e) => setRevisionLimit(e.target.value)} type="number" min="0" max="10" step="1" />
-      <p className="muted small">After the deadline, anyone can trigger a refund to the client if the escrow is still funded.</p>
+      <label>Revisions allowed after a rejection</label>
+      <input value={revisionLimit} onChange={(e) => setRevisionLimit(e.target.value)} inputMode="numeric" />
+      <p className="muted small">
+        If the AI rejects the work, the freelancer may resubmit this many times before the client is refunded (0 =
+        refund on the first rejection). If nothing is settled by the deadline plus a 10-minute grace period, anyone can
+        refund the client.
+      </p>
 
       <label>Requirement (what the AI will judge against)</label>
       <textarea rows={5} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
@@ -209,7 +287,12 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
             Client (MetaMask): <code>{parties.client}</code>
           </p>
           <p>
-            Freelancer: <code>{parties.freelancer}</code>
+            Freelancer:{" "}
+            {parties.freelancer === zeroAddress ? (
+              <em>open: the first freelancer to accept</em>
+            ) : (
+              <code>{parties.freelancer}</code>
+            )}
           </p>
         </div>
       )}
@@ -221,7 +304,14 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
           <p>
             Contract: <code>{created}</code>
           </p>
-          <p>Send this link to the freelancer:</p>
+          {parties?.freelancer === zeroAddress ? (
+            <p>
+              The job is now on the <strong>Open jobs</strong> board (under &quot;I&apos;m the freelancer&quot;). You
+              can also share this link directly:
+            </p>
+          ) : (
+            <p>Send this link to the freelancer:</p>
+          )}
           <code className="wrap">{`${window.location.origin}/?escrow=${created}`}</code>
         </div>
       )}
@@ -231,6 +321,89 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
 
 /* ─────────────────────────── Freelancer ─────────────────────────── */
 
+/** Funded jobs nobody has accepted yet. Accepting is an on-chain transaction from the freelancer's wallet. */
+function OpenJobsBoard({ onPick, onAccount }: { onPick: (addr: string) => void; onAccount: (a: string) => void }) {
+  const [jobs, setJobs] = useState<OpenJob[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [acceptingId, setAcceptingId] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    let stop = false;
+    const load = async () => {
+      try {
+        const d = await api.openJobs();
+        if (!stop) {
+          setJobs(d.jobs);
+          setError(null);
+        }
+      } catch (e) {
+        if (!stop) setError(errMsg(e));
+      }
+    };
+    load();
+    const t = setInterval(load, 15000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [tick]);
+
+  async function accept(job: OpenJob) {
+    setError(null);
+    setNotice(null);
+    setAcceptingId(job.contract_address);
+    try {
+      const who = await acceptOnChain(job.contract_address as Address);
+      onAccount(who);
+      setNotice(
+        `You accepted this job. Submit your work below before ${new Date(job.deadline * 1000).toLocaleString()}.`,
+      );
+      onPick(job.contract_address);
+    } catch (e) {
+      setError(acceptErrMsg(e));
+    } finally {
+      setAcceptingId(null);
+      setTick((n) => n + 1);
+    }
+  }
+
+  return (
+    <section className="card">
+      <h2>Open jobs</h2>
+      <p className="muted">
+        These jobs are already funded: the price is locked in the contract. The first wallet to accept a job is the only
+        one who can submit work and be paid when the AI approves it.
+      </p>
+      {error && <p className="error">{error}</p>}
+      {notice && <p className="result ok">{notice}</p>}
+      {jobs === null && !error && <p className="muted small">Loading open jobs…</p>}
+      {jobs?.length === 0 && <p className="muted small">No open jobs right now.</p>}
+      {jobs?.map((job) => (
+        <article className="job" key={job.contract_address}>
+          <div className="job-head">
+            <strong>
+              {formatEther(BigInt(job.amount_wei))} {CHAIN.nativeCurrency.symbol}
+            </strong>
+            <span className="muted small">
+              due {new Date(job.deadline * 1000).toLocaleString()} · {job.revision_limit} revision
+              {job.revision_limit === 1 ? "" : "s"} · client {shortAddr(job.client_address)}
+            </span>
+          </div>
+          <p className="job-req">{job.requirement}</p>
+          <button onClick={() => accept(job)} disabled={acceptingId !== null}>
+            {acceptingId === job.contract_address ? "Confirm in MetaMask…" : "Accept this job"}
+          </button>
+        </article>
+      ))}
+      <button className="ghost" onClick={() => setTick((n) => n + 1)} disabled={acceptingId !== null}>
+        Refresh
+      </button>
+    </section>
+  );
+}
+
 function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a: string) => void }) {
   const [escrow, setEscrow] = useState(initial);
   const [mode, setMode] = useState<"text" | "link">("text");
@@ -239,15 +412,18 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SubmitResult | null>(null);
   const stage = useStage(busy);
+  const [reload, setReload] = useState(0);
+  const [acceptBusy, setAcceptBusy] = useState(false);
 
   useEffect(() => setEscrow(initial), [initial]);
 
   // Show who this escrow expects, straight from the chain, so a wrong wallet is obvious.
   const [expected, setExpected] = useState<string | null>(null);
   const [dealInfo, setDealInfo] = useState<{
-    deadline?: number;
-    revisionsUsed?: number;
-    revisionLimit?: number;
+    deadline: number;
+    used: number;
+    limit: number;
+    status?: string;
   } | null>(null);
   useEffect(() => {
     setExpected(null);
@@ -257,12 +433,14 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
     api
       .get(escrow)
       .then((d) => {
-        if (!stop) {
-          setExpected(d.chain_freelancer ?? d.escrow.freelancer_address);
+        if (stop) return;
+        setExpected(d.chain_freelancer ?? d.escrow.freelancer_address);
+        if (d.chain_deadline !== undefined) {
           setDealInfo({
             deadline: d.chain_deadline,
-            revisionsUsed: d.chain_revisions_used,
-            revisionLimit: d.chain_revision_limit,
+            used: d.chain_revisions_used ?? 0,
+            limit: d.chain_revision_limit ?? 0,
+            status: d.chain_status,
           });
         }
       })
@@ -270,7 +448,24 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
     return () => {
       stop = true;
     };
-  }, [escrow]);
+  }, [escrow, reload]);
+
+  const canAccept = expected === "" && dealInfo?.status === "funded" && Date.now() / 1000 < (dealInfo?.deadline ?? 0);
+
+  // Used by people who arrive through a shared link to an open job instead of the board.
+  async function accept() {
+    setError(null);
+    setAcceptBusy(true);
+    try {
+      const who = await acceptOnChain(escrow as Address);
+      onAccount(who);
+      setReload((n) => n + 1);
+    } catch (e) {
+      setError(acceptErrMsg(e));
+    } finally {
+      setAcceptBusy(false);
+    }
+  }
 
   async function submit() {
     setError(null);
@@ -284,6 +479,11 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
       onAccount(w.account);
       // Pre-check so a wrong MetaMask account gives a clear message instead of a bare 403.
       const rec = await api.get(escrow);
+      if (rec.chain_freelancer === "") {
+        throw new Error(
+          "This is an open job and nobody has accepted it yet. Accept the job first, then submit your work.",
+        );
+      }
       if (rec.chain_freelancer && rec.chain_freelancer !== rec.escrow.freelancer_address) {
         throw new Error(
           `The backend's record for this escrow is out of date (it likely belongs to an earlier Anvil session): the database says the freelancer is ${rec.escrow.freelancer_address}, the contract says ${rec.chain_freelancer}. Clear the database rows and create a new escrow.`,
@@ -308,84 +508,114 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
   }
 
   return (
-    <section className="card">
-      <h2>Submit work</h2>
-      <p className="muted">Connect with the freelancer wallet the client named in the escrow.</p>
-
-      <label>Escrow contract address</label>
-      <input value={escrow} onChange={(e) => setEscrow(e.target.value.trim())} placeholder="0x…" />
-      {expected && (
-        <p className="muted small">
-          This escrow&apos;s freelancer: <code>{expected}</code>
+    <>
+      <OpenJobsBoard
+        onAccount={onAccount}
+        onPick={(addr) => {
+          setEscrow(addr);
+          setReload((n) => n + 1);
+        }}
+      />
+      <section className="card">
+        <h2>Submit work</h2>
+        <p className="muted">
+          Connect with the freelancer wallet: the one the client named, or the one that accepted the open job.
         </p>
-      )}
-      {dealInfo?.deadline ? (
-        <p className="muted small">
-          Deadline: {new Date(dealInfo.deadline * 1000).toLocaleString()}
-          {dealInfo.revisionLimit !== undefined &&
-            ` · revisions used: ${dealInfo.revisionsUsed ?? 0} of ${dealInfo.revisionLimit}`}
-        </p>
-      ) : null}
 
-      <div className="toggle">
-        <button className={mode === "text" ? "on" : ""} onClick={() => setMode("text")} disabled={busy}>
-          Paste code
-        </button>
-        <button className={mode === "link" ? "on" : ""} onClick={() => setMode("link")} disabled={busy}>
-          Link
-        </button>
-      </div>
-
-      {mode === "text" ? (
-        <textarea rows={8} value={content} onChange={(e) => setContent(e.target.value)} placeholder="Paste your submission…" />
-      ) : (
-        <>
-          <input value={content} onChange={(e) => setContent(e.target.value)} placeholder="https://raw.githubusercontent.com/…" />
-          <p className="muted small">Only raw.githubusercontent.com and gist.githubusercontent.com links are accepted.</p>
-        </>
-      )}
-
-      <button onClick={submit} disabled={busy}>
-        {busy ? "Processing…" : "Submit for AI review"}
-      </button>
-
-      {busy && (
-        <div className="processing">
-          <span className="spinner" />
-          <span>{stage}</span>
-        </div>
-      )}
-      {error && <p className="error">{error}</p>}
-
-      {result && (
-        <div className={`result ${result.decision ? "ok" : result.status === "funded" ? "" : "bad"}`}>
-          <strong>
-            {result.decision
-              ? "Approved: funds released to the freelancer"
-              : result.status === "funded"
-                ? `Revision requested (${result.revisions_used} of ${result.revision_limit} used)`
-                : "Rejected: revision limit reached and funds refunded to the client"}
-          </strong>
-          <p>{result.reasoning}</p>
-          {result.status === "funded" && <p>The freelancer can revise the work and submit it again before the deadline.</p>}
-          <p>
-            Transaction: <TxLink hash={result.tx_hash} />
+        <label>Escrow contract address</label>
+        <input value={escrow} onChange={(e) => setEscrow(e.target.value.trim())} placeholder="0x…" />
+        {expected === "" && (
+          <div className="muted small">
+            <p>Open job: nobody has accepted it yet.</p>
+            {canAccept && (
+              <button onClick={accept} disabled={acceptBusy || busy}>
+                {acceptBusy ? "Confirm in MetaMask…" : "Accept this job"}
+              </button>
+            )}
+          </div>
+        )}
+        {expected && (
+          <p className="muted small">
+            This escrow&apos;s freelancer: <code>{expected}</code>
           </p>
+        )}
+        {dealInfo && (
+          <p className="muted small">
+            Deadline: {new Date(dealInfo.deadline * 1000).toLocaleString()}
+            {Date.now() / 1000 >= dealInfo.deadline ? " (passed)" : ""} · revisions used: {dealInfo.used} of{" "}
+            {dealInfo.limit}
+          </p>
+        )}
+
+        <div className="toggle">
+          <button className={mode === "text" ? "on" : ""} onClick={() => setMode("text")} disabled={busy}>
+            Paste code
+          </button>
+          <button className={mode === "link" ? "on" : ""} onClick={() => setMode("link")} disabled={busy}>
+            Link
+          </button>
         </div>
-      )}
-    </section>
+
+        {mode === "text" ? (
+          <textarea
+            rows={8}
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            placeholder="Paste your submission…"
+          />
+        ) : (
+          <>
+            <input
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+              placeholder="https://raw.githubusercontent.com/…"
+            />
+            <p className="muted small">
+              Only raw.githubusercontent.com and gist.githubusercontent.com links are accepted.
+            </p>
+          </>
+        )}
+
+        <button onClick={submit} disabled={busy}>
+          {busy ? "Processing…" : "Submit for AI review"}
+        </button>
+
+        {busy && (
+          <div className="processing">
+            <span className="spinner" />
+            <span>{stage}</span>
+          </div>
+        )}
+        {error && <p className="error">{error}</p>}
+
+        {result && (
+          <div className={`result ${result.decision ? "ok" : result.status === "funded" ? "" : "bad"}`}>
+            <strong>
+              {result.decision
+                ? "Approved: funds released to the freelancer"
+                : result.status === "funded"
+                  ? `Revision requested (${result.revisions_used} of ${result.revision_limit} used)`
+                  : "Rejected: funds refunded to the client"}
+            </strong>
+            <p>{result.reasoning}</p>
+            {result.status === "funded" && (
+              <p>The funds are still locked. Improve the work and submit again before the deadline.</p>
+            )}
+            <p>
+              Transaction: <TxLink hash={result.tx_hash} />
+            </p>
+          </div>
+        )}
+      </section>
+    </>
   );
 }
 
+/* ───────────────────────────── Track ───────────────────────────── */
+
 function TrackView({ initial }: { initial: string }) {
   const [addr, setAddr] = useState(initial);
-  const [data, setData] = useState<{
-    escrow: EscrowRecord;
-    chain_status?: string;
-    chain_deadline?: number;
-    chain_revision_limit?: number;
-    chain_revisions_used?: number;
-  } | null>(null);
+  const [data, setData] = useState<Awaited<ReturnType<typeof api.get>> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refundBusy, setRefundBusy] = useState(false);
 
@@ -420,9 +650,11 @@ function TrackView({ initial }: { initial: string }) {
   }, [addr]);
 
   const e = data?.escrow;
-  const deadline = data?.chain_deadline ?? (e?.deadline_at ? Math.floor(new Date(e.deadline_at).getTime() / 1000) : 0);
-  const expired = deadline > 0 && Date.now() / 1000 >= deadline;
+  const deadline = data?.chain_deadline ?? 0;
+  const refundableAt = deadline + SETTLEMENT_GRACE_SECONDS;
+  const refundable = deadline > 0 && data?.chain_status === "funded" && Date.now() / 1000 >= refundableAt;
 
+  // Anyone may send this transaction; the contract only ever pays the client.
   async function refundAfterDeadline() {
     setError(null);
     setRefundBusy(true);
@@ -458,18 +690,35 @@ function TrackView({ initial }: { initial: string }) {
           </dd>
           <dt>Backend status</dt>
           <dd>{e.status}</dd>
-          {deadline > 0 && <>
-            <dt>Submission deadline</dt>
-            <dd>{new Date(deadline * 1000).toLocaleString()}{expired ? " · passed" : ""}</dd>
-          </>}
-          {data?.chain_revision_limit !== undefined && <>
-            <dt>Revision opportunities</dt>
-            <dd>{data.chain_revisions_used ?? 0} of {data.chain_revision_limit} used</dd>
-          </>}
+          {deadline > 0 && (
+            <>
+              <dt>Submission deadline</dt>
+              <dd>
+                {new Date(deadline * 1000).toLocaleString()}
+                {Date.now() / 1000 >= deadline ? " · passed" : ""}
+              </dd>
+            </>
+          )}
+          {data?.chain_revision_limit !== undefined && (
+            <>
+              <dt>Revisions used</dt>
+              <dd>
+                {data.chain_revisions_used ?? 0} of {data.chain_revision_limit}
+              </dd>
+            </>
+          )}
           <dt>Client</dt>
-          <dd><code>{e.client_address}</code></dd>
+          <dd>
+            <code>{e.client_address}</code>
+          </dd>
           <dt>Freelancer</dt>
-          <dd><code>{e.freelancer_address}</code></dd>
+          <dd>
+            {e.freelancer_address ? (
+              <code>{e.freelancer_address}</code>
+            ) : (
+              <span className="muted">Open job: nobody has accepted it yet</span>
+            )}
+          </dd>
           <dt>Requirement</dt>
           <dd>{e.initial_prompt}</dd>
           {e.ai_reasoning && (
@@ -481,7 +730,9 @@ function TrackView({ initial }: { initial: string }) {
           {e.tx_hash && (
             <>
               <dt>Settlement tx</dt>
-              <dd><TxLink hash={e.tx_hash} /></dd>
+              <dd>
+                <TxLink hash={e.tx_hash} />
+              </dd>
             </>
           )}
           {e.last_error && (
@@ -490,10 +741,26 @@ function TrackView({ initial }: { initial: string }) {
               <dd className="error">{e.last_error}</dd>
             </>
           )}
-          {expired && data?.chain_status === "funded" && (
+          {refundable && (
             <>
               <dt>Deadline refund</dt>
-              <dd><button onClick={refundAfterDeadline} disabled={refundBusy}>{refundBusy ? "Refunding…" : "Refund funds to client"}</button><p className="muted small">Anyone can submit this transaction; the contract sends the funds directly to the client.</p></dd>
+              <dd>
+                <button onClick={refundAfterDeadline} disabled={refundBusy}>
+                  {refundBusy ? "Refunding…" : "Refund funds to the client"}
+                </button>
+                <p className="muted small">
+                  The deadline and grace period have passed without a verdict. Anyone can send this transaction, and the
+                  funds can only go to the client.
+                </p>
+              </dd>
+            </>
+          )}
+          {deadline > 0 && data?.chain_status === "funded" && !refundable && (
+            <>
+              <dt>Deadline refund</dt>
+              <dd className="muted small">
+                Available from {new Date(refundableAt * 1000).toLocaleString()} if the escrow is still unsettled.
+              </dd>
             </>
           )}
         </dl>
@@ -509,15 +776,17 @@ export default function Home() {
   const [account, setAccount] = useState<string | null>(null);
   const [prefill, setPrefill] = useState("");
   const [identity, setIdentity] = useState<{ address: string; role: "client" | "freelancer" } | null>(null);
-  const [authError, setAuthError] = useState("");
-  const [authBusy, setAuthBusy] = useState(false);
   const [hasMetaMask, setHasMetaMask] = useState(false);
   const [pendingWallet, setPendingWallet] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
   const signInWallet = useRef<Awaited<ReturnType<typeof connect>> | null>(null);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("escrow.identity");
-    if (saved) { try { setIdentity(JSON.parse(saved)); } catch { window.localStorage.removeItem("escrow.identity"); } }
+    try {
+      const saved = window.localStorage.getItem("escrow.identity");
+      if (saved) setIdentity(JSON.parse(saved));
+    } catch { window.localStorage.removeItem("escrow.identity"); }
   }, []);
 
   useEffect(() => {
@@ -538,12 +807,15 @@ export default function Home() {
       .then((a) => setAccount(a[0] ?? null))
       .catch(() => {});
     const onChange = (a: string[]) => {
-      setAccount(a[0] ?? null);
-      if (identity && (a[0] ?? "").toLowerCase() !== identity.address.toLowerCase()) {
-        setIdentity(null); window.localStorage.removeItem("escrow.identity");
+      const next = a[0] ?? null;
+      setAccount(next);
+      if (identity && next?.toLowerCase() !== identity.address.toLowerCase()) {
+        setIdentity(null);
+        window.localStorage.removeItem("escrow.identity");
       }
-      if (pendingWallet && (a[0] ?? "").toLowerCase() !== pendingWallet.toLowerCase()) {
-        setPendingWallet(null); signInWallet.current = null;
+      if (pendingWallet && next?.toLowerCase() !== pendingWallet.toLowerCase()) {
+        setPendingWallet(null);
+        signInWallet.current = null;
       }
     };
     eth.on("accountsChanged", onChange);
@@ -555,9 +827,9 @@ export default function Home() {
     try {
       const wallet = await connect();
       signInWallet.current = wallet;
-      setPendingWallet(wallet.account); setAccount(wallet.account);
-    }
-    catch (e) { setAuthError(walletError(e)); }
+      setPendingWallet(wallet.account);
+      setAccount(wallet.account);
+    } catch (e) { setAuthError(walletError(e)); }
     finally { setAuthBusy(false); }
   }
 
@@ -573,16 +845,18 @@ export default function Home() {
       const verified = await api.authVerify(wallet.account, role, challenge.message, signature);
       const next = { address: verified.address, role: verified.role };
       setIdentity(next); setAccount(verified.address); setTab(role);
-      signInWallet.current = null; setPendingWallet(null);
       window.localStorage.setItem("escrow.identity", JSON.stringify(next));
+      signInWallet.current = null; setPendingWallet(null);
     } catch (e) { setAuthError(walletError(e)); }
     finally { setAuthBusy(false); }
   }
 
   if (!identity) return <main className="auth-shell">
     <section className="auth-card">
-      <div className="brand-mark">AE</div><p className="eyebrow">SECURE WEB3 WORK</p>
-      <h1>AI Escrow</h1><p className="muted">Fair freelance work, protected on-chain.</p>
+      <div className="brand-mark">AE</div>
+      <p className="eyebrow">SECURE WEB3 WORK</p>
+      <h1>AI Escrow</h1>
+      <p className="muted">Fair freelance work, protected on-chain.</p>
       <div className={`setup-note ${hasMetaMask ? "ready" : ""}`}>
         <strong>{hasMetaMask ? "MetaMask detected" : "Before you start"}</strong>
         <ol>
@@ -602,7 +876,7 @@ export default function Home() {
           <button className="ghost" disabled={authBusy} onClick={() => signIn("freelancer")}>Continue as freelancer</button>
         </>
       )}
-      <p className="muted small">Signing a one-time message verifies your wallet. It does not send a transaction or cost gas.</p>
+      <p className="muted small">Signing a one-time message verifies your wallet. It sends no transaction and costs no gas.</p>
       {authError && <p className="error">{authError}</p>}
       <p className="muted small">Network: {CHAIN.name}. MetaMask will prompt you to add it if needed.</p>
     </section>
@@ -613,9 +887,9 @@ export default function Home() {
       <header>
         <div>
           <h1>AI Escrow</h1>
-          <span className="muted small">Funds locked on-chain · AI review · {CHAIN.name}</span>
+          <span className="muted small">Funds locked on-chain · released by AI verdict · {CHAIN.name}</span>
         </div>
-        <div><button className="ghost" onClick={() => { setIdentity(null); window.localStorage.removeItem("escrow.identity"); }}>{shortAddr(identity.address)} · Sign out</button></div>
+        <button className="ghost" onClick={() => { setIdentity(null); window.localStorage.removeItem("escrow.identity"); }}>{shortAddr(identity.address)} · Sign out</button>
       </header>
 
       {account && (

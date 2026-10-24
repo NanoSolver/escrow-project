@@ -44,14 +44,20 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("db ping: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ`); err != nil {
-		log.Fatalf("db migration (deadline_at): %v", err)
+	// Upgrade databases created before deadlines/revisions existed (safe to run every start).
+	for _, stmt := range []string{
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ`,
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS revision_limit INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS revisions_used INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			log.Fatalf("db migration: %v", err)
+		}
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS revision_limit INTEGER NOT NULL DEFAULT 0`); err != nil {
-		log.Fatalf("db migration (revision_limit): %v", err)
-	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submission_text TEXT`); err != nil {
-		log.Fatalf("db migration (submission_text): %v", err)
+
+	// Open jobs have no freelancer until someone accepts them on-chain.
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ALTER COLUMN freelancer_address DROP NOT NULL`); err != nil {
+		log.Fatalf("db migration (open jobs): %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE escrows SET status = 'funded' WHERE status = 'pending_review'`); err != nil {
 		log.Fatalf("db migration (remove pending reviews): %v", err)
@@ -68,6 +74,12 @@ func main() {
 		log.Fatalf("chain: %v", err)
 	}
 	log.Printf("oracle address: %s | chain id: %s", chain.addr.Hex(), chain.chainID)
+	if bal, err := chain.client.BalanceAt(ctx, chain.addr, nil); err == nil {
+		log.Printf("oracle balance: %s wei", bal)
+		if bal.Sign() == 0 {
+			log.Printf("WARNING: the oracle has 0 balance and cannot pay gas to settle escrows. Fund it first")
+		}
+	}
 
 	app := &App{
 		db:    pool,
@@ -83,6 +95,7 @@ func main() {
 	})
 	mux.HandleFunc("POST /auth/challenge", app.authChallenge)
 	mux.HandleFunc("POST /auth/verify", app.authVerify)
+	mux.HandleFunc("GET /escrows", app.listOpenEscrows)
 	mux.HandleFunc("POST /escrows", app.createEscrow)
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)
 	mux.HandleFunc("POST /escrows/{address}/submit", app.submitWork)
