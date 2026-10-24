@@ -22,6 +22,9 @@ type Verdict struct {
 // spinning for several minutes when the provider is unavailable.
 const aiAttempts = 2
 
+// Pause between attempts is attempt * retryBackoff. A variable so tests can shrink it.
+var retryBackoff = 2 * time.Second
+
 // evaluate asks the FastAPI judge for a clear verdict.
 // Malformed replies are retried, and the contract is only touched after a clear decision.
 func (a *App) evaluate(ctx context.Context, requirement, submission string) (Verdict, error) {
@@ -37,7 +40,7 @@ func (a *App) evaluate(ctx context.Context, requirement, submission string) (Ver
 		select {
 		case <-ctx.Done():
 			return Verdict{}, fmt.Errorf("AI evaluation timed out; no blockchain transaction was sent. Please retry: %w", ctx.Err())
-		case <-time.After(time.Duration(attempt) * 2 * time.Second):
+		case <-time.After(time.Duration(attempt) * retryBackoff):
 		}
 	}
 	return Verdict{}, fmt.Errorf("AI evaluation failed after %d attempts: %w", aiAttempts, lastErr)
