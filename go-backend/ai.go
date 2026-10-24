@@ -18,7 +18,7 @@ type Verdict struct {
 }
 
 // Keep the complete review comfortably inside submitWork's two-minute deadline.
-// A single retry is enough for transient Gemini 503s without leaving the UI
+// A single retry is enough for transient provider errors without leaving the UI
 // spinning for several minutes when the provider is unavailable.
 const aiAttempts = 2
 

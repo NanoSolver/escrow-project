@@ -6,18 +6,15 @@ import logging
 import os
 
 from dotenv import load_dotenv
+
+# Load ai-service/.env BEFORE anything reads the environment. override=True means the file
+# wins over any stale API key left in the shell or in Windows environment variables.
 load_dotenv(override=True)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from evaluator import (
-    GEMINI_DEFAULT_MODEL, 
-    OPENROUTER_DEFAULT_MODEL, 
-    Verdict, 
-    evaluate, 
-    provider_name
-)
+from evaluator import OPENROUTER_DEFAULT_MODEL, Verdict, evaluate, provider_name
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai-judge")
@@ -25,38 +22,36 @@ log = logging.getLogger("ai-judge")
 app = FastAPI(title="AI Escrow Judge")
 
 _provider = provider_name()
-if _provider == "ollama":
-    _key_name = "OLLAMA_API_KEY"
-    _default_model = "gpt-oss:120b"
-elif _provider == "openrouter":
-    _key_name = "OPENROUTER_API_KEY"
-    _default_model = OPENROUTER_DEFAULT_MODEL
-else:
-    _key_name = "GEMINI_API_KEY"
-    _default_model = GEMINI_DEFAULT_MODEL
-
+_key_name = "OPENROUTER_API_KEY"
 _key = (os.getenv(_key_name) or "").strip()
 if not _key:
     log.warning("%s is NOT set: calls to %s will fail", _key_name, _provider)
 else:
-    log.info("%s loaded: length=%d, ends with ...%s", _key_name, len(_key), _key[-4:])
-    
-log.info("provider=%s model=%s", _provider, os.getenv("LLM_MODEL", _default_model))
+    log.info("%s loaded", _key_name)
+log.info("provider=%s model=%s", _provider,
+         os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL))
+
 
 class EvaluateRequest(BaseModel):
     requirement: str = Field(min_length=1, max_length=5_000)
     submission: str = Field(min_length=1, max_length=20_000)
 
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True}
+
 
 @app.post("/evaluate", response_model=Verdict)
 async def evaluate_endpoint(req: EvaluateRequest) -> Verdict:
     try:
         verdict = await evaluate(req.requirement, req.submission)
-    except Exception as exc:
+    except Exception as exc:  # LLM down, invalid output after retries, rate limit...
         log.exception("evaluation failed")
+        # Fail closed: never invent a verdict. The Go backend retries on 502
+        # and must not touch the contract until it gets a valid response.
+        # Surface the upstream status/body (e.g. 401 bad key, 404 unknown model, 429 rate limit)
+        # so the Go backend's error message says what actually went wrong.
         detail = f"evaluation failed: {type(exc).__name__}"
         status = getattr(exc, "status_code", None)
         body = getattr(exc, "body", None)

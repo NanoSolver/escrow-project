@@ -8,9 +8,9 @@ import os
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
+
 
 class Verdict(BaseModel):
     decision: bool = Field(
@@ -21,6 +21,7 @@ class Verdict(BaseModel):
         max_length=600,
         description="One to three sentences explaining the decision.",
     )
+
 
 SYSTEM_PROMPT = """\
 You are an impartial code reviewer acting as the arbiter in a freelance escrow.
@@ -50,65 +51,54 @@ Rules:
 
 _agent: Agent | None = None
 
-GEMINI_DEFAULT_MODEL = "gemini-1.5-flash"
-GEMINI_DEFAULT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-OPENROUTER_DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+OPENROUTER_DEFAULT_MODEL = "openrouter/free"
 OPENROUTER_DEFAULT_URL = "https://openrouter.ai/api/v1"
 
+
 def provider_name() -> str:
-    """LLM_PROVIDER=gemini (default), openrouter, or ollama."""
-    return (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+    """The AI judge provider. OpenRouter is the default and only supported provider."""
+    return (os.getenv("LLM_PROVIDER") or "openrouter").strip().lower()
+
 
 def _build_model() -> OpenAIChatModel:
-    provider = provider_name()
-    
-    if provider == "ollama":
-        return OpenAIChatModel(
-            os.getenv("LLM_MODEL", "gpt-oss:120b"), 
-            provider=OllamaProvider(
-                base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
-                api_key=(os.getenv("OLLAMA_API_KEY") or "").strip() or None,
-            ),
-        )
-    elif provider == "openrouter":
-        api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set; add it to ai-service/.env")
-        return OpenAIChatModel(
-            os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL),
-            provider=OpenAIProvider(
-                base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_DEFAULT_URL),
-                api_key=api_key,
-            ),
-        )
-    else:
-        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set; add it to ai-service/.env")
-        return OpenAIChatModel(
-            os.getenv("LLM_MODEL", GEMINI_DEFAULT_MODEL),
-            provider=OpenAIProvider(
-                base_url=os.getenv("GEMINI_BASE_URL", GEMINI_DEFAULT_URL),
-                api_key=api_key,
-            ),
-        )
+    if provider_name() != "openrouter":
+        raise RuntimeError("LLM_PROVIDER must be openrouter")
+    # strip(): a trailing space or newline from copy-paste makes the provider answer 401
+    api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set; add it to ai-service/.env")
+    return OpenAIChatModel(
+        os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL),
+        provider=OpenAIProvider(
+            base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_DEFAULT_URL),
+            api_key=api_key,
+        ),
+    )
+
 
 def _get_agent() -> Agent:
+    """Created lazily so importing this module never needs an API key."""
     global _agent
     if _agent is None:
         model = _build_model()
         _agent = Agent(
             model,
+            # PromptedOutput: schema is injected into the prompt and the reply is parsed.
+            # Works with any model, unlike tool-calling, which depends on model support.
             output_type=PromptedOutput(Verdict),
             system_prompt=SYSTEM_PROMPT,
-            retries=3,  
+            retries=3,  # re-asks the model if its output fails schema validation
+            # generous token cap: reasoning models spend tokens on thinking before answering
             model_settings=ModelSettings(temperature=0, max_tokens=4000),
         )
     return _agent
 
+
 def _neutralise(text: str, tag: str) -> str:
+    """Stop the submission from closing our delimiter tags and smuggling in fake sections."""
     return text.replace(f"</{tag}>", f"<\\/{tag}>").replace(f"<{tag}>", f"<\\{tag}>")
+
 
 async def evaluate(requirement: str, submission: str) -> Verdict:
     prompt = (
