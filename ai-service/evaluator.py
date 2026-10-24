@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
 
@@ -52,18 +53,42 @@ Rules:
 _agent: Agent | None = None
 
 
+GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
+GEMINI_DEFAULT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def provider_name() -> str:
+    """LLM_PROVIDER=gemini (default) or ollama. Both speak the OpenAI chat protocol."""
+    return (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+
+
+def _build_model() -> OpenAIChatModel:
+    # strip(): a trailing space or newline from copy-paste makes the provider answer 401
+    if provider_name() == "ollama":
+        return OpenAIChatModel(
+            os.getenv("LLM_MODEL", "gpt-oss:120b"),  # hosted API uses the plain name, no "-cloud"
+            provider=OllamaProvider(
+                base_url=os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1"),
+                api_key=(os.getenv("OLLAMA_API_KEY") or "").strip() or None,
+            ),
+        )
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set; add it to ai-service/.env")
+    return OpenAIChatModel(
+        os.getenv("LLM_MODEL", GEMINI_DEFAULT_MODEL),
+        provider=OpenAIProvider(
+            base_url=os.getenv("GEMINI_BASE_URL", GEMINI_DEFAULT_URL),
+            api_key=api_key,
+        ),
+    )
+
+
 def _get_agent() -> Agent:
     """Created lazily so importing this module never needs an API key."""
     global _agent
     if _agent is None:
-        model = OpenAIChatModel(
-            os.getenv("LLM_MODEL", "gpt-oss:120b"),  # hosted API uses the plain name, no "-cloud"
-            provider=OllamaProvider(
-                base_url=os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1"),
-                # strip(): a trailing space or newline from copy-paste makes Ollama answer 401
-                api_key=(os.getenv("OLLAMA_API_KEY") or "").strip() or None,
-            ),
-        )
+        model = _build_model()
         _agent = Agent(
             model,
             # PromptedOutput: schema is injected into the prompt and the reply is parsed.
@@ -72,7 +97,7 @@ def _get_agent() -> Agent:
             system_prompt=SYSTEM_PROMPT,
             retries=3,  # re-asks the model if its output fails schema validation
             # generous token cap: reasoning models spend tokens on thinking before answering
-            model_settings=ModelSettings(temperature=0, max_tokens=2000),
+            model_settings=ModelSettings(temperature=0, max_tokens=4000),
         )
     return _agent
 

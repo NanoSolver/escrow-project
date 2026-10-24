@@ -61,6 +61,9 @@ func parseAddress(s string) (common.Address, string, bool) {
 
 // ───────────────────────────── model ─────────────────────────────
 
+var zeroAddress common.Address
+
+// An open job has no freelancer until someone calls acceptJob() on-chain; FreelancerAddress is "".
 type Escrow struct {
 	ContractAddress   string    `json:"contract_address"`
 	ClientAddress     string    `json:"client_address"`
@@ -72,17 +75,22 @@ type Escrow struct {
 	AIReasoning       string    `json:"ai_reasoning"`
 	TxHash            string    `json:"tx_hash"`
 	LastError         string    `json:"last_error"`
+	DeadlineAt        time.Time `json:"deadline_at"`
+	RevisionLimit     int       `json:"revision_limit"`
+	RevisionsUsed     int       `json:"revisions_used"`
 	CreatedAt         time.Time `json:"created_at"`
 }
 
-const escrowCols = `contract_address, client_address, freelancer_address, initial_prompt,
+const escrowCols = `contract_address, client_address, COALESCE(freelancer_address, ''), initial_prompt,
 	COALESCE(submission_link, ''), status, ai_decision, COALESCE(ai_reasoning, ''),
-	COALESCE(tx_hash, ''), COALESCE(last_error, ''), created_at`
+	COALESCE(tx_hash, ''), COALESCE(last_error, ''),
+	COALESCE(deadline_at, to_timestamp(0)), revision_limit, revisions_used, created_at`
 
 func scanEscrow(row pgx.Row) (Escrow, error) {
 	var e Escrow
 	err := row.Scan(&e.ContractAddress, &e.ClientAddress, &e.FreelancerAddress, &e.InitialPrompt,
-		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError, &e.CreatedAt)
+		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError,
+		&e.DeadlineAt, &e.RevisionLimit, &e.RevisionsUsed, &e.CreatedAt)
 	return e, err
 }
 
@@ -91,8 +99,8 @@ func (a *App) loadEscrow(ctx context.Context, addr string) (Escrow, error) {
 }
 
 // ───────────────────── POST /escrows ─────────────────────
-// Called by the frontend after the client deploys the contract. Parties are read from the
-// chain, never trusted from the request body.
+// Called by the frontend after the client deploys the contract. Parties, deadline and revision
+// limit are read from the chain, never trusted from the request body.
 
 func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -120,7 +128,7 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "could not read contract: "+err.Error())
+		writeErr(w, http.StatusBadGateway, "could not read contract (is it a deadline-enabled escrow?): "+err.Error())
 		return
 	}
 	// Refuse contracts that name a different oracle: we could never settle them, and
@@ -138,8 +146,16 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 
 	client := strings.ToLower(info.Client.Hex())
-	freelancer := strings.ToLower(info.Freelancer.Hex())
-	for _, u := range []struct{ addr, role string }{{client, "client"}, {freelancer, "freelancer"}} {
+	users := []struct{ addr, role string }{{client, "client"}}
+	// freelancerArg stays nil (SQL NULL) for an open job nobody has accepted yet.
+	var freelancerArg any
+	freelancer := "open"
+	if info.Freelancer != zeroAddress {
+		freelancer = strings.ToLower(info.Freelancer.Hex())
+		freelancerArg = freelancer
+		users = append(users, struct{ addr, role string }{freelancer, "freelancer"})
+	}
+	for _, u := range users {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO users (wallet_address, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, u.addr, u.role); err != nil {
 			writeErr(w, http.StatusInternalServerError, "db error")
@@ -147,8 +163,11 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO escrows (contract_address, client_address, freelancer_address, initial_prompt, status)
-		 VALUES ($1, $2, $3, $4, $5)`, addrLower, client, freelancer, prompt, statusName(info.Status)); err != nil {
+		`INSERT INTO escrows (contract_address, client_address, freelancer_address, initial_prompt, status,
+		                      deadline_at, revision_limit, revisions_used)
+		 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7, $8)`,
+		addrLower, client, freelancerArg, prompt, statusName(info.Status),
+		float64(info.SubmissionDeadline), int(info.RevisionLimit), int(info.RevisionsUsed)); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			writeErr(w, http.StatusConflict, "escrow already registered")
@@ -168,7 +187,8 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
 	}
-	log.Printf("escrow registered: %s (client %s, freelancer %s)", addrLower, client, freelancer)
+	log.Printf("escrow registered: %s (client %s, freelancer %s, deadline %s, revisions %d)",
+		addrLower, client, freelancer, time.Unix(int64(info.SubmissionDeadline), 0).Format(time.RFC3339), info.RevisionLimit)
 	writeJSON(w, http.StatusCreated, e)
 }
 
@@ -190,17 +210,56 @@ func (a *App) getEscrow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Attach the live on-chain status (the chain, not the DB, is the source of truth for money).
+	// Attach the live on-chain state (the chain, not the DB, is the source of truth for money).
 	resp := map[string]any{"escrow": e}
 	if info, err := a.chain.Info(r.Context(), addr); err == nil {
-		resp["chain_status"] = statusName(info.Status)
-		resp["chain_freelancer"] = strings.ToLower(info.Freelancer.Hex())
+		chainStatus := statusName(info.Status)
+		resp["chain_status"] = chainStatus
+		chainFreelancer := "" // empty = open job, nobody has accepted it yet
+		if info.Freelancer != zeroAddress {
+			chainFreelancer = strings.ToLower(info.Freelancer.Hex())
+		}
+		resp["chain_freelancer"] = chainFreelancer
+		resp["chain_amount_wei"] = info.Amount.String()
+		resp["chain_deadline"] = info.SubmissionDeadline
+		resp["chain_revision_limit"] = info.RevisionLimit
+		resp["chain_revisions_used"] = info.RevisionsUsed
+
+		// Someone accepted an open job directly on-chain: record who (only if this row really
+		// describes this contract).
+		if e.FreelancerAddress == "" && chainFreelancer != "" &&
+			strings.ToLower(info.Client.Hex()) == e.ClientAddress {
+			if err := a.adoptFreelancer(r.Context(), addrLower, info.Freelancer); err == nil {
+				e.FreelancerAddress = chainFreelancer
+				resp["escrow"] = e
+			} else {
+				log.Printf("adopt freelancer for %s: %v", addrLower, err)
+			}
+		}
+
+		// Keep the DB in step with things that happen without the backend, such as someone
+		// calling refundAfterDeadline() directly on the contract.
+		newStatus := e.Status
+		if info.Status == chainReleased || info.Status == chainRefunded {
+			newStatus = chainStatus
+		}
+		if newStatus != e.Status || int(info.RevisionsUsed) != e.RevisionsUsed {
+			if _, err := a.db.Exec(r.Context(),
+				`UPDATE escrows SET status = $2, revisions_used = $3, updated_at = now() WHERE contract_address = $1`,
+				addrLower, newStatus, int(info.RevisionsUsed)); err == nil {
+				e.Status = newStatus
+				e.RevisionsUsed = int(info.RevisionsUsed)
+				resp["escrow"] = e
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // ───────────────────── POST /escrows/{address}/submit ─────────────────────
 // The core pipeline: fetch submission -> AI verdict (with retries) -> sign & send tx -> wait.
+// A verdict has three possible outcomes: release (approved), revision (rejected but the
+// freelancer may try again), or refund (rejected and no revisions left or deadline passed).
 
 func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	addr, addrLower, ok := parseAddress(r.PathValue("address"))
@@ -247,9 +306,26 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 
 	// The DB row must describe THIS contract. After an Anvil restart, a stale row from the
 	// previous chain can share the same address; refuse instead of judging the wrong escrow.
-	if strings.ToLower(info.Freelancer.Hex()) != e.FreelancerAddress ||
-		strings.ToLower(info.Client.Hex()) != e.ClientAddress {
-		writeErr(w, http.StatusConflict, "the database record does not match the contract on-chain (stale escrow from a previous local chain?). Clear it and register the escrow again")
+	staleMsg := "the database record does not match the contract on-chain (stale escrow from a previous local chain?). Clear it and register the escrow again"
+	if strings.ToLower(info.Client.Hex()) != e.ClientAddress {
+		writeErr(w, http.StatusConflict, staleMsg)
+		return
+	}
+	// Open job: work can only be submitted once a freelancer has accepted it on-chain.
+	if info.Freelancer == zeroAddress {
+		writeErr(w, http.StatusConflict, "no freelancer has accepted this open job yet. Accept the job first, then submit your work")
+		return
+	}
+	if e.FreelancerAddress == "" {
+		if err := a.adoptFreelancer(ctx, addrLower, info.Freelancer); err != nil {
+			log.Printf("adopt freelancer for %s: %v", addrLower, err)
+			writeErr(w, http.StatusInternalServerError, "db error")
+			return
+		}
+		e.FreelancerAddress = strings.ToLower(info.Freelancer.Hex())
+	}
+	if strings.ToLower(info.Freelancer.Hex()) != e.FreelancerAddress {
+		writeErr(w, http.StatusConflict, staleMsg)
 		return
 	}
 
@@ -259,8 +335,20 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "only the escrow's freelancer may submit work")
 		return
 	}
+
 	if info.Status != chainFunded {
 		writeErr(w, http.StatusConflict, fmt.Sprintf("escrow is %s on-chain; it must be funded", statusName(info.Status)))
+		return
+	}
+
+	// Deadline: enforced against chain time, the same clock the contract uses.
+	chainNow, err := a.chain.Now(ctx)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if chainNow >= info.SubmissionDeadline {
+		writeErr(w, http.StatusConflict, "the submission deadline has passed; after a short grace period anyone can trigger the on-chain refund to the client")
 		return
 	}
 
@@ -275,7 +363,7 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Atomically claim the escrow so two concurrent submits can't both trigger a payout.
+	// Atomically claim the escrow so two concurrent submits can't both trigger a settlement.
 	tag, err := a.db.Exec(ctx,
 		`UPDATE escrows SET status = 'evaluating', submission_link = $2, last_error = NULL, updated_at = now()
 		 WHERE contract_address = $1 AND status IN ('created', 'funded')`, addrLower, link)
@@ -288,12 +376,17 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// fail puts the escrow back to 'funded' so the freelancer can resubmit, and records why.
+	// fail restores the escrow's real state (normally 'funded') so the freelancer can resubmit,
+	// and records why.
 	fail := func(code int, msg string) {
 		log.Printf("submit failed for %s: %s", addrLower, msg)
 		bg, c := context.WithTimeout(context.Background(), 5*time.Second)
 		defer c()
-		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = 'funded', last_error = $2, updated_at = now() WHERE contract_address = $1`, addrLower, msg)
+		status := "funded"
+		if latest, readErr := a.chain.Info(bg, addr); readErr == nil {
+			status = statusName(latest.Status)
+		}
+		_, _ = a.db.Exec(bg, `UPDATE escrows SET status = $2, last_error = $3, updated_at = now() WHERE contract_address = $1`, addrLower, status, msg)
 		writeErr(w, code, msg)
 	}
 
@@ -305,29 +398,164 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("AI VERDICT: decision=%v | %s", decision, reasoning)
 
-	txHash, err := a.chain.Settle(ctx, addr, decision)
+	// Decide what to do on-chain. Re-read chain time: the AI call may have run past the deadline,
+	// in which case a revision would be pointless and a rejection refunds immediately.
+	nowAfter := chainNow
+	if t, terr := a.chain.Now(ctx); terr == nil {
+		nowAfter = t
+	}
+	action := "refund"
+	switch {
+	case decision:
+		action = "release"
+	case info.RevisionsUsed < info.RevisionLimit && nowAfter < info.SubmissionDeadline:
+		action = "revision"
+	}
+	log.Printf("settlement action for %s: %s (revisions %d/%d)", addrLower, action, info.RevisionsUsed, info.RevisionLimit)
+
+	var txHash string
+	switch action {
+	case "release":
+		txHash, err = a.chain.Settle(ctx, addr, true)
+	case "revision":
+		txHash, err = a.chain.RequestRevision(ctx, addr)
+	default:
+		txHash, err = a.chain.Settle(ctx, addr, false)
+	}
 	if err != nil {
 		fail(http.StatusBadGateway, err.Error())
 		return
 	}
 
 	finalStatus := "refunded"
-	if decision {
+	revisionsUsed := info.RevisionsUsed
+	switch action {
+	case "release":
 		finalStatus = "released"
+	case "revision":
+		finalStatus = "funded"
+		revisionsUsed++
 	}
+
 	bg, c := context.WithTimeout(context.Background(), 5*time.Second)
 	defer c()
 	if _, err := a.db.Exec(bg,
-		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, tx_hash = $5, updated_at = now()
-		 WHERE contract_address = $1`, addrLower, finalStatus, decision, reasoning, txHash); err != nil {
+		`UPDATE escrows SET status = $2, ai_decision = $3, ai_reasoning = $4, tx_hash = $5,
+		        revisions_used = $6, last_error = NULL, updated_at = now()
+		 WHERE contract_address = $1`,
+		addrLower, finalStatus, decision, reasoning, txHash, int(revisionsUsed)); err != nil {
 		// The chain already settled; just report it loudly.
 		log.Printf("WARNING: settled on-chain (tx %s) but DB update failed: %v", txHash, err)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"decision":  decision,
-		"reasoning": reasoning,
-		"status":    finalStatus,
-		"tx_hash":   txHash,
+		"decision":       decision,
+		"reasoning":      reasoning,
+		"status":         finalStatus,
+		"tx_hash":        txHash,
+		"revisions_used": revisionsUsed,
+		"revision_limit": info.RevisionLimit,
 	})
+}
+
+// ───────────────────── open jobs ─────────────────────
+
+// adoptFreelancer stores the wallet that accepted an open job. It only fills an empty slot, so a
+// freelancer already on record can never be overwritten.
+func (a *App) adoptFreelancer(ctx context.Context, addrLower string, freelancer common.Address) error {
+	f := strings.ToLower(freelancer.Hex())
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO users (wallet_address, role) VALUES ($1, 'freelancer') ON CONFLICT DO NOTHING`, f); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE escrows SET freelancer_address = $2, updated_at = now()
+		 WHERE contract_address = $1 AND freelancer_address IS NULL`, addrLower, f); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ───────────────────── GET /escrows (the open-jobs board) ─────────────────────
+// Lists funded jobs that no freelancer has accepted yet. The database is only an index: every
+// candidate is re-checked against the chain before it is shown.
+
+const maxOpenJobs = 20
+
+func (a *App) listOpenEscrows(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	rows, err := a.db.Query(ctx, `SELECT `+escrowCols+` FROM escrows
+		WHERE freelancer_address IS NULL AND status = 'funded'
+		ORDER BY created_at DESC LIMIT $1`, maxOpenJobs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	var candidates []Escrow
+	for rows.Next() {
+		e, err := scanEscrow(rows)
+		if err != nil {
+			rows.Close()
+			writeErr(w, http.StatusInternalServerError, "db error")
+			return
+		}
+		candidates = append(candidates, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+
+	type job struct {
+		ContractAddress string    `json:"contract_address"`
+		ClientAddress   string    `json:"client_address"`
+		Requirement     string    `json:"requirement"`
+		AmountWei       string    `json:"amount_wei"`
+		Deadline        uint64    `json:"deadline"` // unix seconds
+		RevisionLimit   int       `json:"revision_limit"`
+		CreatedAt       time.Time `json:"created_at"`
+	}
+	jobs := make([]job, 0, len(candidates))
+	if len(candidates) > 0 {
+		chainNow, err := a.chain.Now(ctx)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		for _, e := range candidates {
+			info, err := a.chain.Info(ctx, common.HexToAddress(e.ContractAddress))
+			if err != nil {
+				continue // stale row or flaky RPC: simply leave it off the board
+			}
+			if strings.ToLower(info.Client.Hex()) != e.ClientAddress {
+				continue
+			}
+			if info.Freelancer != zeroAddress {
+				// Taken on-chain since we last looked: record it and hide it from the board.
+				if err := a.adoptFreelancer(ctx, e.ContractAddress, info.Freelancer); err != nil {
+					log.Printf("adopt freelancer for %s: %v", e.ContractAddress, err)
+				}
+				continue
+			}
+			if info.Status != chainFunded || chainNow >= info.SubmissionDeadline {
+				continue
+			}
+			jobs = append(jobs, job{
+				ContractAddress: e.ContractAddress,
+				ClientAddress:   e.ClientAddress,
+				Requirement:     e.InitialPrompt,
+				AmountWei:       info.Amount.String(),
+				Deadline:        info.SubmissionDeadline,
+				RevisionLimit:   int(info.RevisionLimit),
+				CreatedAt:       e.CreatedAt,
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 }

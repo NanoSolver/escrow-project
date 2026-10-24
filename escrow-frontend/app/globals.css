@@ -102,3 +102,18 @@ dd { margin: 2px 0 0; word-break: break-word; }
 .pill.funded { background: #9e6a03; }
 .pill.released { background: var(--ok); }
 .pill.refunded { background: var(--bad); }
+
+.job { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
+.job-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; }
+.job-req { margin: 10px 0 0; white-space: pre-wrap; max-height: 9em; overflow: auto; }
+
+.row { display: flex; gap: 8px; }
+.row input { flex: 1; }
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font: inherit;
+}

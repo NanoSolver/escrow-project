@@ -5,6 +5,10 @@ export const CHAIN = process.env.NEXT_PUBLIC_CHAIN === "sepolia" ? sepolia : fou
 
 export const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8080";
 
+// Must match Escrow.SETTLEMENT_GRACE in the contract (10 minutes): after the deadline the oracle
+// keeps this long to finish an in-flight verdict before anyone may refund the client.
+export const SETTLEMENT_GRACE_SECONDS = 600;
+
 // Block explorer link for transactions (no explorer for local Anvil).
 export const EXPLORER_TX: string | null =
   CHAIN.id === sepolia.id ? "https://sepolia.etherscan.io/tx/" : null;

@@ -13,19 +13,27 @@ contract EscrowTest is Test {
     address internal stranger = makeAddr("stranger");
 
     uint256 internal constant AMOUNT = 1 ether;
+    uint8 internal constant REVISIONS = 2;
+    uint64 internal deadline;
 
     event Deposited(address indexed client, uint256 amount);
     event Released(address indexed freelancer, uint256 amount);
     event Refunded(address indexed client, uint256 amount);
+    event RevisionRequested(address indexed freelancer, uint8 revisionsUsed, uint8 revisionLimit);
 
     function setUp() public {
-        escrow = new Escrow(client, freelancer, oracle, AMOUNT);
+        deadline = uint64(block.timestamp + 7 days);
+        escrow = new Escrow(client, freelancer, oracle, AMOUNT, deadline, REVISIONS);
         vm.deal(client, 10 ether);
     }
 
     function _fund() internal {
         vm.prank(client);
         escrow.deposit{value: AMOUNT}();
+    }
+
+    function _pastGrace() internal view returns (uint256) {
+        return uint256(deadline) + escrow.SETTLEMENT_GRACE();
     }
 
     // ───────────── Constructor ─────────────
@@ -35,24 +43,37 @@ contract EscrowTest is Test {
         assertEq(escrow.freelancer(), freelancer);
         assertEq(escrow.oracleAddress(), oracle);
         assertEq(escrow.amount(), AMOUNT);
+        assertEq(escrow.submissionDeadline(), deadline);
+        assertEq(escrow.revisionLimit(), REVISIONS);
+        assertEq(escrow.revisionsUsed(), 0);
         assertEq(uint8(escrow.status()), uint8(Escrow.Status.Created));
     }
 
     function test_constructorRejectsZeroAddress() public {
         vm.expectRevert(Escrow.ZeroAddress.selector);
-        new Escrow(address(0), freelancer, oracle, AMOUNT);
+        new Escrow(address(0), freelancer, oracle, AMOUNT, deadline, REVISIONS);
     }
 
     function test_constructorRejectsZeroAmount() public {
         vm.expectRevert(Escrow.ZeroAmount.selector);
-        new Escrow(client, freelancer, oracle, 0);
+        new Escrow(client, freelancer, oracle, 0, deadline, REVISIONS);
     }
 
     function test_constructorRejectsDuplicateRoles() public {
         vm.expectRevert(Escrow.DuplicateRoles.selector);
-        new Escrow(client, client, oracle, AMOUNT);
+        new Escrow(client, client, oracle, AMOUNT, deadline, REVISIONS);
         vm.expectRevert(Escrow.DuplicateRoles.selector);
-        new Escrow(client, freelancer, client, AMOUNT);
+        new Escrow(client, freelancer, client, AMOUNT, deadline, REVISIONS);
+    }
+
+    function test_constructorRejectsDeadlineNotInFuture() public {
+        vm.expectRevert(Escrow.InvalidDeadline.selector);
+        new Escrow(client, freelancer, oracle, AMOUNT, uint64(block.timestamp), REVISIONS);
+    }
+
+    function test_constructorRejectsTooManyRevisions() public {
+        vm.expectRevert(Escrow.RevisionLimitTooHigh.selector);
+        new Escrow(client, freelancer, oracle, AMOUNT, deadline, 11);
     }
 
     // ───────────── deposit() ─────────────
@@ -83,6 +104,13 @@ contract EscrowTest is Test {
         _fund();
         vm.prank(client);
         vm.expectRevert(abi.encodeWithSelector(Escrow.InvalidStatus.selector, Escrow.Status.Funded));
+        escrow.deposit{value: AMOUNT}();
+    }
+
+    function test_depositRevertsAfterDeadline() public {
+        vm.warp(deadline);
+        vm.prank(client);
+        vm.expectRevert(Escrow.DeadlinePassed.selector);
         escrow.deposit{value: AMOUNT}();
     }
 
@@ -133,6 +161,15 @@ contract EscrowTest is Test {
         vm.stopPrank();
     }
 
+    /// A verdict that was already in flight when the deadline passed can still be settled.
+    function test_oracleCanReleaseDuringGracePeriod() public {
+        _fund();
+        vm.warp(uint256(deadline) + 1);
+        vm.prank(oracle);
+        escrow.releaseFunds();
+        assertEq(freelancer.balance, AMOUNT);
+    }
+
     // ───────────── refundClient() ─────────────
 
     function test_oracleCanRefund() public {
@@ -174,6 +211,135 @@ contract EscrowTest is Test {
         vm.stopPrank();
     }
 
+    // ───────────── requestRevision() ─────────────
+
+    function test_oracleCanRequestRevision() public {
+        _fund();
+
+        vm.expectEmit(true, false, false, true);
+        emit RevisionRequested(freelancer, 1, REVISIONS);
+        vm.prank(oracle);
+        escrow.requestRevision();
+
+        assertEq(escrow.revisionsUsed(), 1);
+        // funds stay locked and the escrow stays open
+        assertEq(uint8(escrow.status()), uint8(Escrow.Status.Funded));
+        assertEq(address(escrow).balance, AMOUNT);
+    }
+
+    function test_requestRevisionRevertsForNonOracle() public {
+        _fund();
+        address[3] memory callers = [client, freelancer, stranger];
+        for (uint256 i; i < callers.length; i++) {
+            vm.prank(callers[i]);
+            vm.expectRevert(Escrow.NotOracle.selector);
+            escrow.requestRevision();
+        }
+    }
+
+    function test_requestRevisionRevertsBeforeDeposit() public {
+        vm.prank(oracle);
+        vm.expectRevert(abi.encodeWithSelector(Escrow.InvalidStatus.selector, Escrow.Status.Created));
+        escrow.requestRevision();
+    }
+
+    function test_requestRevisionStopsAtLimit() public {
+        _fund();
+        vm.startPrank(oracle);
+        escrow.requestRevision();
+        escrow.requestRevision();
+        vm.expectRevert(Escrow.NoRevisionsRemaining.selector);
+        escrow.requestRevision();
+        vm.stopPrank();
+        assertEq(escrow.revisionsUsed(), REVISIONS);
+    }
+
+    function test_zeroRevisionLimitRefusesAnyRevision() public {
+        Escrow e = new Escrow(client, freelancer, oracle, AMOUNT, deadline, 0);
+        vm.prank(client);
+        e.deposit{value: AMOUNT}();
+
+        vm.prank(oracle);
+        vm.expectRevert(Escrow.NoRevisionsRemaining.selector);
+        e.requestRevision();
+    }
+
+    function test_canReleaseAfterRevisions() public {
+        _fund();
+        vm.startPrank(oracle);
+        escrow.requestRevision();
+        escrow.releaseFunds();
+        vm.stopPrank();
+        assertEq(freelancer.balance, AMOUNT);
+    }
+
+    function test_canRefundAfterRevisionsExhausted() public {
+        _fund();
+        uint256 before = client.balance;
+        vm.startPrank(oracle);
+        escrow.requestRevision();
+        escrow.requestRevision();
+        escrow.refundClient();
+        vm.stopPrank();
+        assertEq(client.balance, before + AMOUNT);
+    }
+
+    // ───────────── refundAfterDeadline() ─────────────
+
+    function test_refundAfterDeadlineRevertsBeforeDeadline() public {
+        _fund();
+        vm.prank(stranger);
+        vm.expectRevert(Escrow.DeadlineNotReached.selector);
+        escrow.refundAfterDeadline();
+    }
+
+    function test_refundAfterDeadlineRevertsDuringGracePeriod() public {
+        _fund();
+        vm.warp(_pastGrace() - 1);
+        vm.prank(stranger);
+        vm.expectRevert(Escrow.DeadlineNotReached.selector);
+        escrow.refundAfterDeadline();
+    }
+
+    function test_anyoneCanRefundClientAfterGracePeriod() public {
+        _fund();
+        uint256 before = client.balance;
+        vm.warp(_pastGrace());
+
+        vm.expectEmit(true, false, false, true);
+        emit Refunded(client, AMOUNT);
+        vm.prank(stranger);
+        escrow.refundAfterDeadline();
+
+        assertEq(uint8(escrow.status()), uint8(Escrow.Status.Refunded));
+        assertEq(client.balance, before + AMOUNT); // always to the client, never to the caller
+        assertEq(stranger.balance, 0);
+        assertEq(address(escrow).balance, 0);
+    }
+
+    function test_refundAfterDeadlineRevertsWhenNotFunded() public {
+        vm.warp(_pastGrace());
+        vm.expectRevert(abi.encodeWithSelector(Escrow.InvalidStatus.selector, Escrow.Status.Created));
+        escrow.refundAfterDeadline();
+    }
+
+    function test_refundAfterDeadlineRevertsAfterRelease() public {
+        _fund();
+        vm.prank(oracle);
+        escrow.releaseFunds();
+        vm.warp(_pastGrace());
+        vm.expectRevert(abi.encodeWithSelector(Escrow.InvalidStatus.selector, Escrow.Status.Released));
+        escrow.refundAfterDeadline();
+    }
+
+    function test_cannotRefundAfterDeadlineTwice() public {
+        _fund();
+        vm.warp(_pastGrace());
+        escrow.refundAfterDeadline();
+        vm.expectRevert(abi.encodeWithSelector(Escrow.InvalidStatus.selector, Escrow.Status.Refunded));
+        escrow.refundAfterDeadline();
+    }
+
     // ───────────── Fuzz ─────────────
 
     /// Any amount other than the agreed one must be rejected.
@@ -185,7 +351,7 @@ contract EscrowTest is Test {
         escrow.deposit{value: sent}();
     }
 
-    /// Any random caller (other than the oracle) can never move funds.
+    /// Any random caller (other than the oracle) can never settle or extend the escrow.
     function testFuzz_onlyOracleMovesFunds(address caller) public {
         vm.assume(caller != oracle);
         _fund();
@@ -194,6 +360,8 @@ contract EscrowTest is Test {
         escrow.releaseFunds();
         vm.expectRevert(Escrow.NotOracle.selector);
         escrow.refundClient();
+        vm.expectRevert(Escrow.NotOracle.selector);
+        escrow.requestRevision();
         vm.stopPrank();
         assertEq(address(escrow).balance, AMOUNT);
     }
@@ -201,12 +369,26 @@ contract EscrowTest is Test {
     /// Escrow is generic over amount.
     function testFuzz_fullFlowAnyAmount(uint96 amt) public {
         vm.assume(amt > 0);
-        Escrow e = new Escrow(client, freelancer, oracle, amt);
+        Escrow e = new Escrow(client, freelancer, oracle, amt, deadline, REVISIONS);
         vm.deal(client, amt);
         vm.prank(client);
         e.deposit{value: amt}();
         vm.prank(oracle);
         e.releaseFunds();
         assertEq(freelancer.balance, amt);
+    }
+
+    /// The deadline refund only works strictly after deadline + grace, whatever the time.
+    function testFuzz_refundAfterDeadlineTiming(uint256 t) public {
+        _fund();
+        t = bound(t, block.timestamp, uint256(deadline) + 365 days);
+        vm.warp(t);
+        if (t < _pastGrace()) {
+            vm.expectRevert(Escrow.DeadlineNotReached.selector);
+            escrow.refundAfterDeadline();
+        } else {
+            escrow.refundAfterDeadline();
+            assertEq(uint8(escrow.status()), uint8(Escrow.Status.Refunded));
+        }
     }
 }

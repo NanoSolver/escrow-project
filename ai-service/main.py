@@ -8,27 +8,29 @@ import os
 from dotenv import load_dotenv
 
 # Load ai-service/.env BEFORE anything reads the environment. override=True means the file
-# wins over any stale OLLAMA_API_KEY left in the shell or in Windows environment variables.
+# wins over any stale API key left in the shell or in Windows environment variables.
 load_dotenv(override=True)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from evaluator import Verdict, evaluate
+from evaluator import GEMINI_DEFAULT_MODEL, Verdict, evaluate, provider_name
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai-judge")
 
 app = FastAPI(title="AI Escrow Judge")
 
-_key = (os.getenv("OLLAMA_API_KEY") or "").strip()
+_provider = provider_name()
+_key_name = "OLLAMA_API_KEY" if _provider == "ollama" else "GEMINI_API_KEY"
+_key = (os.getenv(_key_name) or "").strip()
 if not _key:
-    log.warning("OLLAMA_API_KEY is NOT set: Ollama Cloud calls will fail with 401")
+    log.warning("%s is NOT set: calls to %s will fail", _key_name, _provider)
 else:
     # Fingerprint only, so you can confirm WHICH key this process is using.
-    log.info("OLLAMA_API_KEY loaded: length=%d, ends with ...%s", len(_key), _key[-4:])
-log.info("model=%s base_url=%s", os.getenv("LLM_MODEL", "gpt-oss:120b"),
-         os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1"))
+    log.info("%s loaded: length=%d, ends with ...%s", _key_name, len(_key), _key[-4:])
+log.info("provider=%s model=%s", _provider,
+         os.getenv("LLM_MODEL", "gpt-oss:120b" if _provider == "ollama" else GEMINI_DEFAULT_MODEL))
 
 
 class EvaluateRequest(BaseModel):

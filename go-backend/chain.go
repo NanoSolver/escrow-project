@@ -24,8 +24,13 @@ const escrowABI = `[
  {"type":"function","name":"client","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
  {"type":"function","name":"freelancer","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
  {"type":"function","name":"oracleAddress","inputs":[],"outputs":[{"name":"","type":"address"}],"stateMutability":"view"},
+ {"type":"function","name":"amount","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+ {"type":"function","name":"submissionDeadline","inputs":[],"outputs":[{"name":"","type":"uint64"}],"stateMutability":"view"},
+ {"type":"function","name":"revisionLimit","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
+ {"type":"function","name":"revisionsUsed","inputs":[],"outputs":[{"name":"","type":"uint8"}],"stateMutability":"view"},
  {"type":"function","name":"releaseFunds","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
- {"type":"function","name":"refundClient","inputs":[],"outputs":[],"stateMutability":"nonpayable"}
+ {"type":"function","name":"refundClient","inputs":[],"outputs":[],"stateMutability":"nonpayable"},
+ {"type":"function","name":"requestRevision","inputs":[],"outputs":[],"stateMutability":"nonpayable"}
 ]`
 
 // Mirrors the Solidity enum order.
@@ -62,8 +67,11 @@ type Chain struct {
 }
 
 type EscrowInfo struct {
-	Client, Freelancer, Oracle common.Address
-	Status                     uint8
+	Client, Freelancer, Oracle   common.Address
+	Status                       uint8
+	Amount                       *big.Int // wei locked (or to be locked) in the escrow
+	SubmissionDeadline           uint64   // unix seconds
+	RevisionLimit, RevisionsUsed uint8
 }
 
 func NewChain(ctx context.Context, rpcURL, privateKeyHex string) (*Chain, error) {
@@ -119,6 +127,30 @@ func (c *Chain) callAddr(ctx context.Context, bc *bind.BoundContract, method str
 	return a, nil
 }
 
+func (c *Chain) callUint8(ctx context.Context, bc *bind.BoundContract, method string) (uint8, error) {
+	v, err := c.callOne(ctx, bc, method)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := v.(uint8)
+	if !ok {
+		return 0, fmt.Errorf("call %s: unexpected type %T", method, v)
+	}
+	return n, nil
+}
+
+func (c *Chain) callUint64(ctx context.Context, bc *bind.BoundContract, method string) (uint64, error) {
+	v, err := c.callOne(ctx, bc, method)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := v.(uint64)
+	if !ok {
+		return 0, fmt.Errorf("call %s: unexpected type %T", method, v)
+	}
+	return n, nil
+}
+
 // HasCode reports whether a contract exists at addr on the connected chain.
 func (c *Chain) HasCode(ctx context.Context, addr common.Address) (bool, error) {
 	code, err := c.client.CodeAt(ctx, addr, nil)
@@ -128,7 +160,18 @@ func (c *Chain) HasCode(ctx context.Context, addr common.Address) (bool, error) 
 	return len(code) > 0, nil
 }
 
-// Info reads the escrow's parties and live status straight from the chain.
+// Now returns the timestamp of the latest block. Deadlines are enforced against chain time,
+// the same clock the contract uses, so the backend and contract always agree.
+func (c *Chain) Now(ctx context.Context) (uint64, error) {
+	h, err := c.client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("latest block: %w", err)
+	}
+	return h.Time, nil
+}
+
+// Info reads the escrow's parties, deadline, revisions and live status straight from the chain.
+// Contracts without deadline support (the older ABI) fail here with a clear error.
 func (c *Chain) Info(ctx context.Context, addr common.Address) (EscrowInfo, error) {
 	var info EscrowInfo
 	code, err := c.client.CodeAt(ctx, addr, nil)
@@ -149,21 +192,45 @@ func (c *Chain) Info(ctx context.Context, addr common.Address) (EscrowInfo, erro
 	if info.Oracle, err = c.callAddr(ctx, bc, "oracleAddress"); err != nil {
 		return info, err
 	}
-	v, err := c.callOne(ctx, bc, "status")
+	if info.Status, err = c.callUint8(ctx, bc, "status"); err != nil {
+		return info, err
+	}
+	amt, err := c.callOne(ctx, bc, "amount")
 	if err != nil {
 		return info, err
 	}
-	s, ok := v.(uint8)
-	if !ok {
-		return info, fmt.Errorf("status: unexpected type %T", v)
+	var okAmt bool
+	if info.Amount, okAmt = amt.(*big.Int); !okAmt {
+		return info, fmt.Errorf("call amount: unexpected type %T", amt)
 	}
-	info.Status = s
+	if info.SubmissionDeadline, err = c.callUint64(ctx, bc, "submissionDeadline"); err != nil {
+		return info, err
+	}
+	if info.RevisionLimit, err = c.callUint8(ctx, bc, "revisionLimit"); err != nil {
+		return info, err
+	}
+	if info.RevisionsUsed, err = c.callUint8(ctx, bc, "revisionsUsed"); err != nil {
+		return info, err
+	}
 	return info, nil
 }
 
 // Settle signs and sends releaseFunds() (release=true) or refundClient() (release=false)
 // with the oracle key, then waits until the transaction is mined.
 func (c *Chain) Settle(ctx context.Context, addr common.Address, release bool) (string, error) {
+	method := "refundClient"
+	if release {
+		method = "releaseFunds"
+	}
+	return c.transact(ctx, addr, method)
+}
+
+// RequestRevision records a rejection that still allows a resubmission. Funds stay locked.
+func (c *Chain) RequestRevision(ctx context.Context, addr common.Address) (string, error) {
+	return c.transact(ctx, addr, "requestRevision")
+}
+
+func (c *Chain) transact(ctx context.Context, addr common.Address, method string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -172,11 +239,6 @@ func (c *Chain) Settle(ctx context.Context, addr common.Address, release bool) (
 		return "", err
 	}
 	opts.Context = ctx
-
-	method := "refundClient"
-	if release {
-		method = "releaseFunds"
-	}
 
 	tx, err := c.bound(addr).Transact(opts, method)
 	if err != nil {
