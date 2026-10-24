@@ -108,6 +108,9 @@ dd { margin: 2px 0 0; word-break: break-word; }
 .submission-panel { margin-top: 12px; }
 .review-submission { margin: 8px 0; padding: 12px; max-height: 24em; overflow: auto; white-space: pre-wrap; word-break: break-word;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 0.85rem; }
+.section-title { margin: 18px 0 0; font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+details.manual { margin-top: 8px; }
+details.manual summary { cursor: pointer; }
 .job-req { margin: 10px 0 0; white-space: pre-wrap; max-height: 9em; overflow: auto; }
 
 .row { display: flex; gap: 8px; }

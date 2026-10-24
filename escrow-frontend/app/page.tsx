@@ -27,6 +27,45 @@ function walletError(e: unknown): string {
 
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
+const fmtAmount = (wei?: string) => (wei ? `${formatEther(BigInt(wei))} ${CHAIN.nativeCurrency.symbol}` : "");
+
+/** The signed-in wallet's own escrows (as client or as freelancer). pollMs = 0 loads just once. */
+function useMyEscrows(identity: Identity, refreshKey = 0, pollMs = 10000) {
+  const [items, setItems] = useState<ClientEscrow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const token = identity.token;
+
+  useEffect(() => {
+    if (!token) {
+      setError("Your sign-in predates this feature. Sign out (top right) and sign in again.");
+      return;
+    }
+    let stop = false;
+    const load = async () => {
+      try {
+        const d =
+          identity.role === "client"
+            ? await api.clientEscrows(identity.address, token)
+            : await api.freelancerEscrows(identity.address, token);
+        if (!stop) {
+          setItems(d.escrows);
+          setError(null);
+        }
+      } catch (e) {
+        if (!stop) setError(errMsg(e));
+      }
+    };
+    load();
+    const t = pollMs > 0 ? setInterval(load, pollMs) : undefined;
+    return () => {
+      stop = true;
+      if (t) clearInterval(t);
+    };
+  }, [identity.address, identity.role, token, refreshKey, pollMs]);
+
+  return { items, error };
+}
+
 // Backend does not expose its phase, so avoid claiming a chain confirmation is pending too early.
 const AI_STAGES = [
   "Fetching your submission…",
@@ -405,7 +444,102 @@ function OpenJobsBoard({ onPick, onAccount }: { onPick: (addr: string) => void; 
   );
 }
 
-function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a: string) => void }) {
+/** Everything this freelancer was assigned or has accepted, so nobody has to paste an address. */
+function MyJobs({
+  items,
+  error,
+  selected,
+  onSelect,
+  token,
+}: {
+  items: ClientEscrow[] | null;
+  error: string | null;
+  selected: string;
+  onSelect: (addr: string) => void;
+  token?: string;
+}) {
+  const [viewing, setViewing] = useState<string | null>(null);
+  const isActive = (s: string) => s === "created" || s === "funded" || s === "evaluating";
+  const active = items?.filter((i) => isActive(i.status)) ?? [];
+  const finished = items?.filter((i) => !isActive(i.status)) ?? [];
+
+  const row = (it: ClientEscrow) => {
+    const due = it.deadline_at ? new Date(it.deadline_at) : null;
+    const hasDue = due !== null && due.getFullYear() > 1971;
+    const isSel = selected.toLowerCase() === it.contract_address;
+    const isViewing = viewing === it.contract_address;
+    return (
+      <article className="job" key={it.contract_address}>
+        <div className="job-head">
+          <span>
+            <strong>{fmtAmount(it.amount_wei) || "Escrow"}</strong>{" "}
+            <span className={`pill ${it.status}`}>{it.status}</span>
+          </span>
+          <span className="muted small">
+            {hasDue && due ? `due ${due.toLocaleString()}${due.getTime() < Date.now() ? " (passed)" : ""} · ` : ""}
+            revisions {it.revisions_used} of {it.revision_limit} · client {shortAddr(it.client_address)}
+          </span>
+        </div>
+        <p className="job-req">{it.initial_prompt}</p>
+        {it.ai_reasoning && (
+          <p className="small">
+            <strong>{it.ai_decision === false ? "Latest AI feedback: " : "Latest AI review: "}</strong>
+            {it.ai_reasoning}
+          </p>
+        )}
+        {it.status === "released" && <p className="small">Paid: the funds were released to you.</p>}
+        {it.status === "refunded" && <p className="small">The funds went back to the client.</p>}
+        <div className="toggle">
+          {isActive(it.status) && (
+            <button
+              className={isSel ? "on" : ""}
+              onClick={() => onSelect(it.contract_address)}
+              disabled={it.status === "evaluating"}
+            >
+              {it.status === "evaluating" ? "AI review in progress…" : isSel ? "Selected ✓" : "Work on this job"}
+            </button>
+          )}
+          {it.has_submission && (
+            <button onClick={() => setViewing(isViewing ? null : it.contract_address)}>
+              {isViewing ? "Hide my submission" : "View my submission"}
+            </button>
+          )}
+        </div>
+        {isViewing && token && (
+          <SubmissionPanel address={it.contract_address} token={token} submittedAt={it.submitted_at} />
+        )}
+      </article>
+    );
+  };
+
+  return (
+    <section className="card">
+      <h2>My jobs</h2>
+      <p className="muted">Jobs the client assigned to you and open jobs you accepted. Pick one to work on it.</p>
+      {error && <p className="error">{error}</p>}
+      {items === null && !error && <p className="muted small">Loading your jobs…</p>}
+      {items?.length === 0 && (
+        <p className="muted small">
+          Nothing yet. Accept one of the open jobs below, or ask a client to assign you one.
+        </p>
+      )}
+      {active.length > 0 && <h3 className="section-title">In progress</h3>}
+      {active.map(row)}
+      {finished.length > 0 && <h3 className="section-title">Finished</h3>}
+      {finished.map(row)}
+    </section>
+  );
+}
+
+function FreelancerView({
+  initial,
+  identity,
+  onAccount,
+}: {
+  initial: string;
+  identity: Identity;
+  onAccount: (a: string) => void;
+}) {
   const [escrow, setEscrow] = useState(initial);
   const [mode, setMode] = useState<"text" | "link">("text");
   const [content, setContent] = useState("");
@@ -418,6 +552,38 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
 
   useEffect(() => setEscrow(initial), [initial]);
 
+  // "My jobs" list, and remembering the last job you picked so a page reload keeps it.
+  const { items: myJobs, error: jobsError } = useMyEscrows(identity, reload);
+  const SELECTED_KEY = `escrow.selected.${identity.address}`;
+  useEffect(() => {
+    if (initial) return;
+    try {
+      const saved = window.localStorage.getItem(SELECTED_KEY);
+      if (saved && isAddress(saved)) setEscrow(saved);
+    } catch {
+      /* storage unavailable: just start without a selection */
+    }
+  }, [initial, SELECTED_KEY]);
+  useEffect(() => {
+    if (!isAddress(escrow)) return;
+    try {
+      window.localStorage.setItem(SELECTED_KEY, escrow);
+    } catch {
+      /* ignore */
+    }
+  }, [escrow, SELECTED_KEY]);
+  const selectedJob = myJobs?.find((j) => j.contract_address === escrow.toLowerCase());
+
+  function selectJob(addr: string) {
+    if (addr !== escrow) {
+      setResult(null);
+      setError(null);
+      setContent("");
+    }
+    setEscrow(addr);
+    document.getElementById("submit-work")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   // Show who this escrow expects, straight from the chain, so a wrong wallet is obvious.
   const [expected, setExpected] = useState<string | null>(null);
   const [dealInfo, setDealInfo] = useState<{
@@ -425,6 +591,7 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
     used: number;
     limit: number;
     status?: string;
+    requirement: string;
   } | null>(null);
   useEffect(() => {
     setExpected(null);
@@ -442,6 +609,7 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
             used: d.chain_revisions_used ?? 0,
             limit: d.chain_revision_limit ?? 0,
             status: d.chain_status,
+            requirement: d.escrow.initial_prompt,
           });
         }
       })
@@ -505,11 +673,13 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
       setError(errMsg(e));
     } finally {
       setBusy(false);
+      setReload((n) => n + 1); // refresh My jobs and the job details
     }
   }
 
   return (
     <>
+      <MyJobs items={myJobs} error={jobsError} selected={escrow} onSelect={selectJob} token={identity.token} />
       <OpenJobsBoard
         onAccount={onAccount}
         onPick={(addr) => {
@@ -517,14 +687,29 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
           setReload((n) => n + 1);
         }}
       />
-      <section className="card">
+      <section className="card" id="submit-work">
         <h2>Submit work</h2>
         <p className="muted">
           Connect with the freelancer wallet: the one the client named, or the one that accepted the open job.
         </p>
 
-        <label>Escrow contract address</label>
-        <input value={escrow} onChange={(e) => setEscrow(e.target.value.trim())} placeholder="0x…" />
+        {selectedJob ? (
+          <p>
+            <strong>{fmtAmount(selectedJob.amount_wei) || "Selected job"}</strong> ·{" "}
+            <code>{shortAddr(selectedJob.contract_address)}</code>{" "}
+            <span className={`pill ${selectedJob.status}`}>{selectedJob.status}</span>
+          </p>
+        ) : isAddress(escrow) ? (
+          <p className="muted small">
+            Escrow <code>{shortAddr(escrow)}</code> (not in your list yet)
+          </p>
+        ) : (
+          <p className="muted small">Pick one of your jobs above or accept an open job. No typing needed.</p>
+        )}
+        <details className="manual">
+          <summary className="muted small">Use a different escrow address</summary>
+          <input value={escrow} onChange={(e) => setEscrow(e.target.value.trim())} placeholder="0x…" />
+        </details>
         {expected === "" && (
           <div className="muted small">
             <p>Open job: nobody has accepted it yet.</p>
@@ -546,6 +731,13 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
             {Date.now() / 1000 >= dealInfo.deadline ? " (passed)" : ""} · revisions used: {dealInfo.used} of{" "}
             {dealInfo.limit}
           </p>
+        )}
+
+        {dealInfo?.requirement && (
+          <>
+            <label>Requirement</label>
+            <p className="job-req">{dealInfo.requirement}</p>
+          </>
         )}
 
         <div className="toggle">
@@ -844,7 +1036,8 @@ function ReviewView({ identity, onAccount }: { identity: Identity; onAccount: (a
 
 /* ───────────────────────────── Track ───────────────────────────── */
 
-function TrackView({ initial }: { initial: string }) {
+function TrackView({ initial, identity }: { initial: string; identity: Identity }) {
+  const { items: mine } = useMyEscrows(identity, 0, 0);
   const [addr, setAddr] = useState(initial);
   const [data, setData] = useState<Awaited<ReturnType<typeof api.get>> | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -910,6 +1103,22 @@ function TrackView({ initial }: { initial: string }) {
   return (
     <section className="card">
       <h2>Track escrow</h2>
+      {mine && mine.length > 0 && (
+        <>
+          <label>Your escrows</label>
+          <select
+            value={mine.some((i) => i.contract_address === addr.toLowerCase()) ? addr.toLowerCase() : ""}
+            onChange={(ev) => setAddr(ev.target.value)}
+          >
+            <option value="">Pick one of yours…</option>
+            {mine.map((i) => (
+              <option key={i.contract_address} value={i.contract_address}>
+                {fmtAmount(i.amount_wei) || "escrow"} · {shortAddr(i.contract_address)} · {i.status}
+              </option>
+            ))}
+          </select>
+        </>
+      )}
       <label>Escrow contract address</label>
       <input value={addr} onChange={(ev) => setAddr(ev.target.value.trim())} placeholder="0x…" />
       {error && <p className="error">{error}</p>}
@@ -1199,9 +1408,9 @@ export default function Home() {
       {tab === "client" && identity.role === "client" && <ClientView onAccount={setAccount} />}
       {tab === "review" && identity.role === "client" && <ReviewView identity={identity} onAccount={setAccount} />}
       {tab === "freelancer" && identity.role === "freelancer" && (
-        <FreelancerView initial={prefill} onAccount={setAccount} />
+        <FreelancerView initial={prefill} identity={identity} onAccount={setAccount} />
       )}
-      {tab === "track" && <TrackView initial={prefill} />}
+      {tab === "track" && <TrackView initial={prefill} identity={identity} />}
     </main>
   );
 }

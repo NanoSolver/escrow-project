@@ -59,6 +59,7 @@ func main() {
 	for _, stmt := range []string{
 		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submission_text TEXT`,
 		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ`,
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS amount_wei TEXT`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			log.Fatalf("db migration (submissions): %v", err)
@@ -109,6 +110,7 @@ func main() {
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)
 	mux.HandleFunc("GET /escrows/{address}/submission", app.getSubmission)
 	mux.HandleFunc("GET /clients/{address}/escrows", app.listClientEscrows)
+	mux.HandleFunc("GET /freelancers/{address}/escrows", app.listFreelancerEscrows)
 	mux.HandleFunc("POST /escrows/{address}/submit", app.submitWork)
 
 	srv := &http.Server{

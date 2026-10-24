@@ -1,6 +1,7 @@
 import { BACKEND_URL } from "./config";
 
 export type EscrowRecord = {
+  amount_wei: string; // "" if the backend has not read it from the chain yet
   contract_address: string;
   client_address: string;
   freelancer_address: string;
@@ -111,6 +112,9 @@ export const api = {
   // Both need the session token returned by sign-in.
   clientEscrows: (address: string, token: string) =>
     req<{ escrows: ClientEscrow[] }>(`/clients/${address}/escrows`, undefined, token),
+
+  freelancerEscrows: (address: string, token: string) =>
+    req<{ escrows: ClientEscrow[] }>(`/freelancers/${address}/escrows`, undefined, token),
 
   submission: (address: string, token: string) =>
     req<SubmissionView>(`/escrows/${address}/submission`, undefined, token),
