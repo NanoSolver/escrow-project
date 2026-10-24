@@ -14,7 +14,7 @@ load_dotenv(override=True)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from evaluator import GEMINI_DEFAULT_MODEL, Verdict, evaluate, provider_name
+from evaluator import OPENROUTER_DEFAULT_MODEL, Verdict, evaluate, provider_name
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai-judge")
@@ -22,15 +22,14 @@ log = logging.getLogger("ai-judge")
 app = FastAPI(title="AI Escrow Judge")
 
 _provider = provider_name()
-_key_name = "OLLAMA_API_KEY" if _provider == "ollama" else "GEMINI_API_KEY"
+_key_name = "OPENROUTER_API_KEY"
 _key = (os.getenv(_key_name) or "").strip()
 if not _key:
     log.warning("%s is NOT set: calls to %s will fail", _key_name, _provider)
 else:
-    # Fingerprint only, so you can confirm WHICH key this process is using.
-    log.info("%s loaded: length=%d, ends with ...%s", _key_name, len(_key), _key[-4:])
+    log.info("%s loaded", _key_name)
 log.info("provider=%s model=%s", _provider,
-         os.getenv("LLM_MODEL", "gpt-oss:120b" if _provider == "ollama" else GEMINI_DEFAULT_MODEL))
+         os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL))
 
 
 class EvaluateRequest(BaseModel):

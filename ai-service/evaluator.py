@@ -8,7 +8,6 @@ import os
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -53,32 +52,26 @@ Rules:
 _agent: Agent | None = None
 
 
-GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
-GEMINI_DEFAULT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENROUTER_DEFAULT_MODEL = "openrouter/free"
+OPENROUTER_DEFAULT_URL = "https://openrouter.ai/api/v1"
 
 
 def provider_name() -> str:
-    """LLM_PROVIDER=gemini (default) or ollama. Both speak the OpenAI chat protocol."""
-    return (os.getenv("LLM_PROVIDER") or "gemini").strip().lower()
+    """The AI judge provider. OpenRouter is the default and only supported provider."""
+    return (os.getenv("LLM_PROVIDER") or "openrouter").strip().lower()
 
 
 def _build_model() -> OpenAIChatModel:
+    if provider_name() != "openrouter":
+        raise RuntimeError("LLM_PROVIDER must be openrouter")
     # strip(): a trailing space or newline from copy-paste makes the provider answer 401
-    if provider_name() == "ollama":
-        return OpenAIChatModel(
-            os.getenv("LLM_MODEL", "gpt-oss:120b"),  # hosted API uses the plain name, no "-cloud"
-            provider=OllamaProvider(
-                base_url=os.getenv("OLLAMA_BASE_URL", "https://ollama.com/v1"),
-                api_key=(os.getenv("OLLAMA_API_KEY") or "").strip() or None,
-            ),
-        )
-    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set; add it to ai-service/.env")
+        raise RuntimeError("OPENROUTER_API_KEY is not set; add it to ai-service/.env")
     return OpenAIChatModel(
-        os.getenv("LLM_MODEL", GEMINI_DEFAULT_MODEL),
+        os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL),
         provider=OpenAIProvider(
-            base_url=os.getenv("GEMINI_BASE_URL", GEMINI_DEFAULT_URL),
+            base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_DEFAULT_URL),
             api_key=api_key,
         ),
     )
