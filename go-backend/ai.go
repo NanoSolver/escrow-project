@@ -13,36 +13,38 @@ import (
 )
 
 type Verdict struct {
-	Decision  *bool  `json:"decision"` // pointer so a missing field is detected, not read as false
+	Decision  *bool  `json:"decision"`
 	Reasoning string `json:"reasoning"`
 }
 
-const aiAttempts = 3
+// Keep the complete review comfortably inside submitWork's two-minute deadline.
+// A single retry is enough for transient Gemini 503s without leaving the UI
+// spinning for several minutes when the provider is unavailable.
+const aiAttempts = 2
 
-// evaluate asks the FastAPI judge for a verdict. Anything other than a well-formed
-// {decision: bool, reasoning: string} is treated as a failure and retried. The contract is
-// only touched when this returns nil error, so a hallucinated reply can never move funds.
-func (a *App) evaluate(ctx context.Context, requirement, submission string) (bool, string, error) {
+// evaluate asks the FastAPI judge for a clear verdict.
+// Malformed replies are retried, and the contract is only touched after a clear decision.
+func (a *App) evaluate(ctx context.Context, requirement, submission string) (Verdict, error) {
 	var lastErr error
 	for attempt := 1; attempt <= aiAttempts; attempt++ {
 		v, err := a.callAI(ctx, requirement, submission)
 		if err == nil {
-			return *v.Decision, v.Reasoning, nil
+			return v, nil
 		}
 		lastErr = err
 		log.Printf("AI attempt %d/%d failed: %v", attempt, aiAttempts, err)
 
 		select {
 		case <-ctx.Done():
-			return false, "", ctx.Err()
+			return Verdict{}, fmt.Errorf("AI evaluation timed out; no blockchain transaction was sent. Please retry: %w", ctx.Err())
 		case <-time.After(time.Duration(attempt) * 2 * time.Second):
 		}
 	}
-	return false, "", fmt.Errorf("AI evaluation failed after %d attempts: %w", aiAttempts, lastErr)
+	return Verdict{}, fmt.Errorf("AI evaluation failed after %d attempts: %w", aiAttempts, lastErr)
 }
 
 func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdict, error) {
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
 	payload, _ := json.Marshal(map[string]string{
@@ -73,11 +75,11 @@ func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdi
 	if err := json.Unmarshal(body, &v); err != nil {
 		return Verdict{}, fmt.Errorf("invalid JSON from AI: %w", err)
 	}
-	if v.Decision == nil {
-		return Verdict{}, fmt.Errorf("AI reply missing 'decision'")
-	}
 	if strings.TrimSpace(v.Reasoning) == "" {
 		return Verdict{}, fmt.Errorf("AI reply missing 'reasoning'")
+	}
+	if v.Decision == nil {
+		return Verdict{}, fmt.Errorf("AI reply did not provide a clear decision")
 	}
 	return v, nil
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { formatEther, isAddress, parseEther, zeroAddress, type Address, type EIP1193Provider } from "viem";
 import { api, type OpenJob, type SubmitResult } from "../lib/api";
 import { CHAIN, EXPLORER_TX, SETTLEMENT_GRACE_SECONDS } from "../lib/config";
@@ -16,14 +16,22 @@ function errMsg(e: unknown): string {
   return x?.shortMessage ?? x?.message ?? String(e);
 }
 
+function walletError(e: unknown): string {
+  const x = e as { code?: number; message?: string; shortMessage?: string };
+  if (x?.code === 4001 || /user rejected|request rejected/i.test(x?.message ?? "")) {
+    return "MetaMask sign-in was canceled. Retry and approve the one-time signature; it is not a transaction and costs no gas.";
+  }
+  return errMsg(e);
+}
+
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-// The AI + blockchain step takes 5-15 s, so show progress text instead of a frozen button.
+// Backend does not expose its phase, so avoid claiming a chain confirmation is pending too early.
 const AI_STAGES = [
   "Fetching your submission…",
   "Processing AI evaluation…",
   "The AI is reviewing the work against the requirement…",
-  "Waiting for blockchain confirmation…",
+  "The AI provider is taking longer than usual; this may take up to about 90 seconds…",
 ];
 
 function useStage(active: boolean) {
@@ -767,6 +775,19 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("client");
   const [account, setAccount] = useState<string | null>(null);
   const [prefill, setPrefill] = useState("");
+  const [identity, setIdentity] = useState<{ address: string; role: "client" | "freelancer" } | null>(null);
+  const [hasMetaMask, setHasMetaMask] = useState(false);
+  const [pendingWallet, setPendingWallet] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const signInWallet = useRef<Awaited<ReturnType<typeof connect>> | null>(null);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("escrow.identity");
+      if (saved) setIdentity(JSON.parse(saved));
+    } catch { window.localStorage.removeItem("escrow.identity"); }
+  }, []);
 
   useEffect(() => {
     const e = new URLSearchParams(window.location.search).get("escrow");
@@ -780,22 +801,86 @@ export default function Home() {
   useEffect(() => {
     const eth = (window as unknown as { ethereum?: EIP1193Provider }).ethereum;
     if (!eth) return;
+    setHasMetaMask(true);
     eth
       .request({ method: "eth_accounts" })
       .then((a) => setAccount(a[0] ?? null))
       .catch(() => {});
-    const onChange = (a: string[]) => setAccount(a[0] ?? null);
+    const onChange = (a: string[]) => {
+      const next = a[0] ?? null;
+      setAccount(next);
+      if (identity && next?.toLowerCase() !== identity.address.toLowerCase()) {
+        setIdentity(null);
+        window.localStorage.removeItem("escrow.identity");
+      }
+      if (pendingWallet && next?.toLowerCase() !== pendingWallet.toLowerCase()) {
+        setPendingWallet(null);
+        signInWallet.current = null;
+      }
+    };
     eth.on("accountsChanged", onChange);
     return () => eth.removeListener("accountsChanged", onChange);
-  }, []);
+  }, [identity, pendingWallet]);
 
-  async function connectWallet() {
+  async function connectForSignIn() {
+    setAuthError(""); setAuthBusy(true);
     try {
-      setAccount((await connect()).account);
-    } catch {
-      /* the action buttons show wallet errors; ignore here */
-    }
+      const wallet = await connect();
+      signInWallet.current = wallet;
+      setPendingWallet(wallet.account);
+      setAccount(wallet.account);
+    } catch (e) { setAuthError(walletError(e)); }
+    finally { setAuthBusy(false); }
   }
+
+  async function signIn(role: "client" | "freelancer") {
+    setAuthError(""); setAuthBusy(true);
+    try {
+      const wallet = signInWallet.current ?? await connect();
+      if (pendingWallet && wallet.account.toLowerCase() !== pendingWallet.toLowerCase()) {
+        throw new Error("The connected MetaMask account changed. Connect the intended account and try again.");
+      }
+      const challenge = await api.authChallenge(wallet.account, role);
+      const signature = await wallet.walletClient.signMessage({ account: wallet.account, message: challenge.message });
+      const verified = await api.authVerify(wallet.account, role, challenge.message, signature);
+      const next = { address: verified.address, role: verified.role };
+      setIdentity(next); setAccount(verified.address); setTab(role);
+      window.localStorage.setItem("escrow.identity", JSON.stringify(next));
+      signInWallet.current = null; setPendingWallet(null);
+    } catch (e) { setAuthError(walletError(e)); }
+    finally { setAuthBusy(false); }
+  }
+
+  if (!identity) return <main className="auth-shell">
+    <section className="auth-card">
+      <div className="brand-mark">AE</div>
+      <p className="eyebrow">SECURE WEB3 WORK</p>
+      <h1>AI Escrow</h1>
+      <p className="muted">Fair freelance work, protected on-chain.</p>
+      <div className={`setup-note ${hasMetaMask ? "ready" : ""}`}>
+        <strong>{hasMetaMask ? "MetaMask detected" : "Before you start"}</strong>
+        <ol>
+          <li><a href="https://metamask.io/download/" target="_blank" rel="noreferrer">Install the MetaMask browser extension</a>.</li>
+          <li>Open MetaMask and create a wallet or import your existing one.</li>
+          <li>Come back here and sign in with that wallet.</li>
+        </ol>
+        <p className="muted small">Never share your recovery phrase or private key with this site.</p>
+      </div>
+      {!pendingWallet ? (
+        hasMetaMask ? <button disabled={authBusy} onClick={connectForSignIn}>{authBusy ? "Connecting…" : "Sign in with MetaMask"}</button> :
+          <a className="button-link" href="https://metamask.io/download/" target="_blank" rel="noreferrer">Get MetaMask</a>
+      ) : (
+        <>
+          <p className="muted small">Connected wallet: <code>{shortAddr(pendingWallet)}</code>. Choose your role to finish signing in.</p>
+          <button disabled={authBusy} onClick={() => signIn("client")}>{authBusy ? "Verifying signature…" : "Continue as client"}</button>
+          <button className="ghost" disabled={authBusy} onClick={() => signIn("freelancer")}>Continue as freelancer</button>
+        </>
+      )}
+      <p className="muted small">Signing a one-time message verifies your wallet. It sends no transaction and costs no gas.</p>
+      {authError && <p className="error">{authError}</p>}
+      <p className="muted small">Network: {CHAIN.name}. MetaMask will prompt you to add it if needed.</p>
+    </section>
+  </main>;
 
   return (
     <main>
@@ -804,9 +889,7 @@ export default function Home() {
           <h1>AI Escrow</h1>
           <span className="muted small">Funds locked on-chain · released by AI verdict · {CHAIN.name}</span>
         </div>
-        <button className="ghost" onClick={connectWallet}>
-          {account ? shortAddr(account) : "Connect MetaMask"}
-        </button>
+        <button className="ghost" onClick={() => { setIdentity(null); window.localStorage.removeItem("escrow.identity"); }}>{shortAddr(identity.address)} · Sign out</button>
       </header>
 
       {account && (
@@ -818,8 +901,7 @@ export default function Home() {
       <nav className="tabs">
         {(
           [
-            ["client", "I'm the client"],
-            ["freelancer", "I'm the freelancer"],
+            [identity.role, identity.role === "client" ? "Client dashboard" : "Freelancer dashboard"],
             ["track", "Track escrow"],
           ] as const
         ).map(([id, label]) => (
@@ -829,8 +911,8 @@ export default function Home() {
         ))}
       </nav>
 
-      {tab === "client" && <ClientView onAccount={setAccount} />}
-      {tab === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
+      {tab === "client" && identity.role === "client" && <ClientView onAccount={setAccount} />}
+      {tab === "freelancer" && identity.role === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
       {tab === "track" && <TrackView initial={prefill} />}
     </main>
   );

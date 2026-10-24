@@ -65,6 +65,18 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => req<{ ok: boolean; oracle: string }>("/health"),
 
+  authChallenge: (address: string, role: "client" | "freelancer") =>
+    req<{ message: string }>("/auth/challenge", {
+      method: "POST",
+      body: JSON.stringify({ address, role }),
+    }),
+
+  authVerify: (address: string, role: "client" | "freelancer", message: string, signature: string) =>
+    req<{ address: string; role: "client" | "freelancer" }>("/auth/verify", {
+      method: "POST",
+      body: JSON.stringify({ address, role, message, signature }),
+    }),
+
   register: (contract_address: string, initial_prompt: string) =>
     req<EscrowRecord>("/escrows", {
       method: "POST",

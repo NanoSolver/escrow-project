@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: escrow
       POSTGRES_DB: escrow
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # runs once, on first start of an empty volume

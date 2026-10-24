@@ -59,6 +59,15 @@ func main() {
 	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ALTER COLUMN freelancer_address DROP NOT NULL`); err != nil {
 		log.Fatalf("db migration (open jobs): %v", err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE escrows SET status = 'funded' WHERE status = 'pending_review'`); err != nil {
+		log.Fatalf("db migration (remove pending reviews): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP CONSTRAINT IF EXISTS escrows_status_check, ADD CONSTRAINT escrows_status_check CHECK (status IN ('created', 'funded', 'evaluating', 'released', 'refunded'))`); err != nil {
+		log.Fatalf("db migration (status): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP COLUMN IF EXISTS human_decision, DROP COLUMN IF EXISTS human_reasoning`); err != nil {
+		log.Fatalf("db migration (remove reviewer data): %v", err)
+	}
 
 	chain, err := NewChain(ctx, mustEnv("RPC_URL"), mustEnv("ORACLE_PRIVATE_KEY"))
 	if err != nil {
@@ -84,6 +93,8 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "oracle": chain.addr.Hex()})
 	})
+	mux.HandleFunc("POST /auth/challenge", app.authChallenge)
+	mux.HandleFunc("POST /auth/verify", app.authVerify)
 	mux.HandleFunc("GET /escrows", app.listOpenEscrows)
 	mux.HandleFunc("POST /escrows", app.createEscrow)
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)

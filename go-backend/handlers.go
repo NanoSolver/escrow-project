@@ -391,11 +391,13 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("evaluating submission for %s ...", addrLower)
-	decision, reasoning, err := a.evaluate(ctx, e.InitialPrompt, submission)
+	verdict, err := a.evaluate(ctx, e.InitialPrompt, submission)
 	if err != nil {
 		fail(http.StatusBadGateway, err.Error()) // contract untouched
 		return
 	}
+	decision := *verdict.Decision
+	reasoning := verdict.Reasoning
 	log.Printf("AI VERDICT: decision=%v | %s", decision, reasoning)
 
 	// Decide what to do on-chain. Re-read chain time: the AI call may have run past the deadline,

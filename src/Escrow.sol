@@ -44,6 +44,7 @@ contract Escrow {
     event Refunded(address indexed client, uint256 amount);
     event RevisionRequested(address indexed freelancer, uint8 revisionsUsed, uint8 revisionLimit);
     event JobAccepted(address indexed freelancer);
+    event ClientApproved(address indexed client, address indexed freelancer, uint256 amount);
 
     // ──────────────────────────── Errors ─────────────────────────────
     error ZeroAddress();
@@ -151,6 +152,16 @@ contract Escrow {
 
         revisionsUsed += 1;
         emit RevisionRequested(freelancer, revisionsUsed, revisionLimit);
+    }
+
+    /// @notice Client approves AI-approved work and releases the escrowed funds.
+    function approveByClient() external onlyClient inStatus(Status.Funded) {
+        if (block.timestamp >= submissionDeadline) revert DeadlinePassed();
+        if (freelancer == address(0)) revert NoFreelancer();
+        status = Status.Released;
+        (bool ok, ) = payable(freelancer).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit ClientApproved(client, freelancer, amount);
     }
 
     /// @notice Oracle rejects the work for good (no revisions left): return the funds to the client.
