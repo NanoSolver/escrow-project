@@ -18,7 +18,10 @@ type Verdict struct {
 	Reasoning        string `json:"reasoning"`
 }
 
-const aiAttempts = 3
+// Keep the complete review comfortably inside submitWork's two-minute deadline.
+// A single retry is enough for transient Gemini 503s without leaving the UI
+// spinning for several minutes when the provider is unavailable.
+const aiAttempts = 2
 
 // evaluate asks the FastAPI judge for a clear verdict or an explicit human-review request.
 // Malformed replies are retried, and the contract is only touched after a clear decision.
@@ -34,7 +37,7 @@ func (a *App) evaluate(ctx context.Context, requirement, submission string) (Ver
 
 		select {
 		case <-ctx.Done():
-			return Verdict{}, ctx.Err()
+			return Verdict{}, fmt.Errorf("AI evaluation timed out; no blockchain transaction was sent. Please retry: %w", ctx.Err())
 		case <-time.After(time.Duration(attempt) * 2 * time.Second):
 		}
 	}
@@ -42,7 +45,7 @@ func (a *App) evaluate(ctx context.Context, requirement, submission string) (Ver
 }
 
 func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdict, error) {
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
 	payload, _ := json.Marshal(map[string]string{

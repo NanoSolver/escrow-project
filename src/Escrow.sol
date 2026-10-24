@@ -28,6 +28,8 @@ contract Escrow {
     event Released(address indexed freelancer, uint256 amount);
     event Refunded(address indexed client, uint256 amount);
     event RevisionRequested(address indexed freelancer, uint8 revisionsUsed, uint8 revisionLimit);
+    event ClientApproved(address indexed client, address indexed freelancer, uint256 amount);
+    event ClientReviewRequested(address indexed client);
 
     // ──────────────────────────── Errors ─────────────────────────────
     error ZeroAddress();
@@ -42,6 +44,9 @@ contract Escrow {
     error DeadlineNotReached();
     error NoRevisionsRemaining();
     error RevisionLimitTooHigh();
+    error AlreadyRequested();
+
+    bool public clientReviewRequested;
 
     // ─────────────────────────── Modifiers ───────────────────────────
     modifier onlyClient() {
@@ -124,6 +129,22 @@ contract Escrow {
         if (revisionsUsed >= revisionLimit) revert NoRevisionsRemaining();
         revisionsUsed += 1;
         emit RevisionRequested(freelancer, revisionsUsed, revisionLimit);
+    }
+
+    /// @notice Client approves AI-approved work and releases the escrowed funds.
+    function approveByClient() external onlyClient inStatus(Status.Funded) {
+        if (block.timestamp >= submissionDeadline) revert DeadlinePassed();
+        status = Status.Released;
+        (bool ok, ) = payable(freelancer).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit ClientApproved(client, freelancer, amount);
+    }
+
+    /// @notice Client disputes an AI approval; funds remain locked for human review.
+    function requestHumanReview() external onlyClient inStatus(Status.Funded) {
+        if (clientReviewRequested) revert AlreadyRequested();
+        clientReviewRequested = true;
+        emit ClientReviewRequested(client);
     }
 
     /// @notice Anyone can return stuck funds to the client after the submission deadline.

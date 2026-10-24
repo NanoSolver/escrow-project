@@ -18,12 +18,13 @@ function errMsg(e: unknown): string {
 
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-// The AI + blockchain step takes 5-15 s, so show progress text instead of a frozen button.
+// The API does not expose its internal phase, so do not claim a chain
+// confirmation is pending while the AI review may still be running.
 const AI_STAGES = [
   "Fetching your submission…",
   "Processing AI evaluation…",
   "The AI is reviewing the work against the requirement…",
-  "Waiting for blockchain confirmation…",
+  "The AI provider is taking longer than usual; this can take up to about 90 seconds…",
 ];
 
 function useStage(active: boolean) {
