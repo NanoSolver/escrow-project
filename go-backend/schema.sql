@@ -14,6 +14,8 @@ CREATE TABLE escrows (
     client_address     TEXT NOT NULL REFERENCES users (wallet_address),
     freelancer_address TEXT REFERENCES users (wallet_address),  -- NULL = open job nobody has accepted yet
     initial_prompt     TEXT NOT NULL,          -- the requirement the AI judges against
+    submission_text    TEXT,                   -- latest submission, shown to the client and freelancer only
+    submitted_at       TIMESTAMPTZ,
     submission_link    TEXT,                   -- link (or 'inline-text') of the latest submission
     status             TEXT NOT NULL DEFAULT 'created'
                        CHECK (status IN ('created', 'funded', 'evaluating', 'released', 'refunded')),

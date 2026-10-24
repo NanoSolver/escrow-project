@@ -105,6 +105,9 @@ dd { margin: 2px 0 0; word-break: break-word; }
 
 .job { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; }
 .job-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; }
+.submission-panel { margin-top: 12px; }
+.review-submission { margin: 8px 0; padding: 12px; max-height: 24em; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 0.85rem; }
 .job-req { margin: 10px 0 0; white-space: pre-wrap; max-height: 9em; overflow: auto; }
 
 .row { display: flex; gap: 8px; }

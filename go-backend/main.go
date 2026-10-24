@@ -55,6 +55,15 @@ func main() {
 		}
 	}
 
+	// The client reviews the latest submission, so it is stored (the link alone can change or vanish).
+	for _, stmt := range []string{
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submission_text TEXT`,
+		`ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			log.Fatalf("db migration (submissions): %v", err)
+		}
+	}
 	// Open jobs have no freelancer until someone accepts them on-chain.
 	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ALTER COLUMN freelancer_address DROP NOT NULL`); err != nil {
 		log.Fatalf("db migration (open jobs): %v", err)
@@ -98,6 +107,8 @@ func main() {
 	mux.HandleFunc("GET /escrows", app.listOpenEscrows)
 	mux.HandleFunc("POST /escrows", app.createEscrow)
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)
+	mux.HandleFunc("GET /escrows/{address}/submission", app.getSubmission)
+	mux.HandleFunc("GET /clients/{address}/escrows", app.listClientEscrows)
 	mux.HandleFunc("POST /escrows/{address}/submit", app.submitWork)
 
 	srv := &http.Server{
