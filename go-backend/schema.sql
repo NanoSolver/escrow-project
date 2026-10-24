@@ -14,13 +14,11 @@ CREATE TABLE escrows (
     freelancer_address TEXT NOT NULL REFERENCES users (wallet_address),
     initial_prompt     TEXT NOT NULL,          -- the requirement the AI judges against
     submission_link    TEXT,                   -- link (or 'inline-text') of the latest submission
-    submission_text    TEXT,                   -- retained only for the protected human-review queue
+    submission_text    TEXT,
     status             TEXT NOT NULL DEFAULT 'created'
-                       CHECK (status IN ('created', 'funded', 'evaluating', 'pending_review', 'released', 'refunded')),
+                       CHECK (status IN ('created', 'funded', 'evaluating', 'released', 'refunded')),
     ai_decision        BOOLEAN,
     ai_reasoning       TEXT,
-    human_decision     BOOLEAN,
-    human_reasoning    TEXT,
     tx_hash            TEXT,                   -- release/refund transaction
     last_error         TEXT,                   -- last AI/chain failure, for debugging
     deadline_at        TIMESTAMPTZ,

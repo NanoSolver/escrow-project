@@ -1,19 +1,27 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { isAddress, parseEther, type Address, type EIP1193Provider } from "viem";
-import { api, type EscrowRecord, type HumanReview, type SubmitResult } from "../lib/api";
+import { api, type EscrowRecord, type SubmitResult } from "../lib/api";
 import { CHAIN, EXPLORER_TX } from "../lib/config";
 import { escrowAbi, escrowBytecode } from "../lib/escrow";
 import { connect } from "../lib/wallet";
 
-type Tab = "client" | "freelancer" | "track" | "review";
+type Tab = "client" | "freelancer" | "track";
 type StepState = "todo" | "active" | "done" | "error";
 type Step = { label: string; state: StepState };
 
 function errMsg(e: unknown): string {
   const x = e as { shortMessage?: string; message?: string };
   return x?.shortMessage ?? x?.message ?? String(e);
+}
+
+function walletError(e: unknown): string {
+  const x = e as { code?: number; message?: string; shortMessage?: string };
+  if (x?.code === 4001 || /user rejected|request rejected/i.test(x?.message ?? "")) {
+    return "MetaMask sign-in was canceled. Click Continue again, then approve the one-time signature request; it is not a transaction and costs no gas.";
+  }
+  return errMsg(e);
 }
 
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -172,7 +180,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   return (
     <section className="card">
       <h2>Create escrow</h2>
-      <p className="muted">Lock funds in a smart contract. The AI reviews the work, and unclear cases wait for a human reviewer.</p>
+      <p className="muted">Lock funds in a smart contract. The AI reviews submitted work against your requirement.</p>
 
       <label>Freelancer wallet address</label>
       <input value={freelancer} onChange={(e) => setFreelancer(e.target.value.trim())} placeholder="0x…" />
@@ -349,13 +357,7 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
       )}
       {error && <p className="error">{error}</p>}
 
-      {result && result.needs_human_review ? (
-        <div className="result">
-          <strong>Human review needed · funds remain in escrow</strong>
-          <p>{result.reasoning}</p>
-          <p>A reviewer will assess the submission. Check this escrow’s status in Track escrow.</p>
-        </div>
-      ) : result && (
+      {result && (
         <div className={`result ${result.decision ? "ok" : result.status === "funded" ? "" : "bad"}`}>
           <strong>
             {result.decision
@@ -374,76 +376,6 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
     </section>
   );
 }
-
-function HumanReviewView() {
-  const [token, setToken] = useState("");
-  const [reviews, setReviews] = useState<HumanReview[]>([]);
-  const [reasons, setReasons] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function refresh() {
-    setError(null);
-    try {
-      const data = await api.reviews(token);
-      setReviews(data.reviews);
-      setMessage(null);
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  }
-
-  async function decide(address: string, decision: boolean) {
-    const reasoning = reasons[address]?.trim() ?? "";
-    if (!reasoning) {
-      setError("Add a short explanation for the human decision.");
-      return;
-    }
-    setBusy(address);
-    setError(null);
-    try {
-      const result = await api.decideReview(address, token, decision, reasoning);
-      setMessage(`Review recorded: ${result.status}.`);
-      setReviews((items) => items.filter((item) => item.contract_address !== address));
-    } catch (e) {
-      setError(errMsg(e));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  return (
-    <section className="card">
-      <h2>Human review queue</h2>
-      <p className="muted">Cases the AI could not judge clearly stay funded until a reviewer decides.</p>
-      <label>Reviewer access token</label>
-      <input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="HUMAN_REVIEW_TOKEN" />
-      <button onClick={refresh} disabled={!token || busy !== null}>Load pending reviews</button>
-      {message && <p className="result ok">{message}</p>}
-      {error && <p className="error">{error}</p>}
-      {reviews.length === 0 && !error && <p className="muted">No pending cases loaded.</p>}
-      {reviews.map((review) => (
-        <article className="review-item" key={review.contract_address}>
-          <h3>Escrow <code>{shortAddr(review.contract_address)}</code></h3>
-          <p><strong>Requirement</strong><br />{review.requirement}</p>
-          <p><strong>AI explanation</strong><br />{review.ai_reasoning}</p>
-          {review.submission_link !== "inline-text" && <p><strong>Submission link</strong><br /><a href={review.submission_link} target="_blank" rel="noreferrer">{review.submission_link}</a></p>}
-          <details><summary>View submitted work</summary><pre className="review-submission">{review.submission}</pre></details>
-          <label>Why is this your decision?</label>
-          <textarea rows={3} value={reasons[review.contract_address] ?? ""} onChange={(event) => setReasons((state) => ({ ...state, [review.contract_address]: event.target.value }))} />
-          <div className="toggle">
-            <button onClick={() => decide(review.contract_address, true)} disabled={busy !== null}>{busy === review.contract_address ? "Settling…" : "Approve and release"}</button>
-            <button onClick={() => decide(review.contract_address, false)} disabled={busy !== null}>{busy === review.contract_address ? "Settling…" : "Reject / request revision"}</button>
-          </div>
-          <p className="muted small">If no revisions remain, rejection refunds the client. After the deadline, the contract only allows a refund.</p>
-        </article>
-      ))}
-    </section>
-  );
-}
-
-/* ───────────────────────────── Track ───────────────────────────── */
 
 function TrackView({ initial }: { initial: string }) {
   const [addr, setAddr] = useState(initial);
@@ -546,12 +478,6 @@ function TrackView({ initial }: { initial: string }) {
               <dd>{e.ai_reasoning}</dd>
             </>
           )}
-          {e.human_decision !== null && (
-            <>
-              <dt>Human review</dt>
-              <dd>{e.human_decision ? "Approved" : "Rejected"}{e.human_reasoning ? ` · ${e.human_reasoning}` : ""}</dd>
-            </>
-          )}
           {e.tx_hash && (
             <>
               <dt>Settlement tx</dt>
@@ -582,6 +508,17 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("client");
   const [account, setAccount] = useState<string | null>(null);
   const [prefill, setPrefill] = useState("");
+  const [identity, setIdentity] = useState<{ address: string; role: "client" | "freelancer" } | null>(null);
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [hasMetaMask, setHasMetaMask] = useState(false);
+  const [pendingWallet, setPendingWallet] = useState<string | null>(null);
+  const signInWallet = useRef<Awaited<ReturnType<typeof connect>> | null>(null);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("escrow.identity");
+    if (saved) { try { setIdentity(JSON.parse(saved)); } catch { window.localStorage.removeItem("escrow.identity"); } }
+  }, []);
 
   useEffect(() => {
     const e = new URLSearchParams(window.location.search).get("escrow");
@@ -595,33 +532,90 @@ export default function Home() {
   useEffect(() => {
     const eth = (window as unknown as { ethereum?: EIP1193Provider }).ethereum;
     if (!eth) return;
+    setHasMetaMask(true);
     eth
       .request({ method: "eth_accounts" })
       .then((a) => setAccount(a[0] ?? null))
       .catch(() => {});
-    const onChange = (a: string[]) => setAccount(a[0] ?? null);
+    const onChange = (a: string[]) => {
+      setAccount(a[0] ?? null);
+      if (identity && (a[0] ?? "").toLowerCase() !== identity.address.toLowerCase()) {
+        setIdentity(null); window.localStorage.removeItem("escrow.identity");
+      }
+      if (pendingWallet && (a[0] ?? "").toLowerCase() !== pendingWallet.toLowerCase()) {
+        setPendingWallet(null); signInWallet.current = null;
+      }
+    };
     eth.on("accountsChanged", onChange);
     return () => eth.removeListener("accountsChanged", onChange);
-  }, []);
+  }, [identity, pendingWallet]);
 
-  async function connectWallet() {
+  async function connectForSignIn() {
+    setAuthError(""); setAuthBusy(true);
     try {
-      setAccount((await connect()).account);
-    } catch {
-      /* the action buttons show wallet errors; ignore here */
+      const wallet = await connect();
+      signInWallet.current = wallet;
+      setPendingWallet(wallet.account); setAccount(wallet.account);
     }
+    catch (e) { setAuthError(walletError(e)); }
+    finally { setAuthBusy(false); }
   }
+
+  async function signIn(role: "client" | "freelancer") {
+    setAuthError(""); setAuthBusy(true);
+    try {
+      const wallet = signInWallet.current ?? await connect();
+      if (pendingWallet && wallet.account.toLowerCase() !== pendingWallet.toLowerCase()) {
+        throw new Error("The connected MetaMask account changed. Connect the intended account and try again.");
+      }
+      const challenge = await api.authChallenge(wallet.account, role);
+      const signature = await wallet.walletClient.signMessage({ account: wallet.account, message: challenge.message });
+      const verified = await api.authVerify(wallet.account, role, challenge.message, signature);
+      const next = { address: verified.address, role: verified.role };
+      setIdentity(next); setAccount(verified.address); setTab(role);
+      signInWallet.current = null; setPendingWallet(null);
+      window.localStorage.setItem("escrow.identity", JSON.stringify(next));
+    } catch (e) { setAuthError(walletError(e)); }
+    finally { setAuthBusy(false); }
+  }
+
+  if (!identity) return <main className="auth-shell">
+    <section className="auth-card">
+      <div className="brand-mark">AE</div><p className="eyebrow">SECURE WEB3 WORK</p>
+      <h1>AI Escrow</h1><p className="muted">Fair freelance work, protected on-chain.</p>
+      <div className={`setup-note ${hasMetaMask ? "ready" : ""}`}>
+        <strong>{hasMetaMask ? "MetaMask detected" : "Before you start"}</strong>
+        <ol>
+          <li><a href="https://metamask.io/download/" target="_blank" rel="noreferrer">Install the MetaMask browser extension</a>.</li>
+          <li>Open MetaMask and create a wallet or import your existing one.</li>
+          <li>Come back here and sign in with that wallet.</li>
+        </ol>
+        <p className="muted small">Never share your recovery phrase or private key with this site.</p>
+      </div>
+      {!pendingWallet ? (
+        hasMetaMask ? <button disabled={authBusy} onClick={connectForSignIn}>{authBusy ? "Connecting…" : "Sign in with MetaMask"}</button> :
+          <a className="button-link" href="https://metamask.io/download/" target="_blank" rel="noreferrer">Get MetaMask</a>
+      ) : (
+        <>
+          <p className="muted small">Connected wallet: <code>{shortAddr(pendingWallet)}</code>. Choose your role to finish signing in.</p>
+          <button disabled={authBusy} onClick={() => signIn("client")}>{authBusy ? "Verifying signature…" : "Continue as client"}</button>
+          <button className="ghost" disabled={authBusy} onClick={() => signIn("freelancer")}>Continue as freelancer</button>
+        </>
+      )}
+      <p className="muted small">Signing a one-time message verifies your wallet. It does not send a transaction or cost gas.</p>
+      {authError && <p className="error">{authError}</p>}
+      <p className="muted small">Network: {CHAIN.name}. MetaMask will prompt you to add it if needed.</p>
+    </section>
+  </main>;
 
   return (
     <main>
       <header>
         <div>
           <h1>AI Escrow</h1>
-          <span className="muted small">Funds locked on-chain · AI review with human fallback · {CHAIN.name}</span>
+          <span className="muted small">Funds locked on-chain · AI review · {CHAIN.name}</span>
         </div>
-        <button className="ghost" onClick={connectWallet}>
-          {account ? shortAddr(account) : "Connect MetaMask"}
-        </button>
+        <div><button className="ghost" onClick={() => { setIdentity(null); window.localStorage.removeItem("escrow.identity"); }}>{shortAddr(identity.address)} · Sign out</button></div>
       </header>
 
       {account && (
@@ -633,10 +627,8 @@ export default function Home() {
       <nav className="tabs">
         {(
           [
-            ["client", "I'm the client"],
-            ["freelancer", "I'm the freelancer"],
+            [identity.role, identity.role === "client" ? "Client dashboard" : "Freelancer dashboard"],
             ["track", "Track escrow"],
-            ["review", "Human review"],
           ] as const
         ).map(([id, label]) => (
           <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>
@@ -645,10 +637,9 @@ export default function Home() {
         ))}
       </nav>
 
-      {tab === "client" && <ClientView onAccount={setAccount} />}
-      {tab === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
+      {tab === "client" && identity.role === "client" && <ClientView onAccount={setAccount} />}
+      {tab === "freelancer" && identity.role === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
       {tab === "track" && <TrackView initial={prefill} />}
-      {tab === "review" && <HumanReviewView />}
     </main>
   );
 }

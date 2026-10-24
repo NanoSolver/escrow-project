@@ -13,12 +13,7 @@ from pydantic_ai.settings import ModelSettings
 
 
 class Verdict(BaseModel):
-    decision: bool | None = Field(
-        description="True if clearly satisfied, false if clearly not satisfied, null if the case needs a human."
-    )
-    needs_human_review: bool = Field(
-        description="True only when the submission cannot be judged fairly and reliably from the available evidence."
-    )
+    decision: bool = Field(description="True if the submission satisfies the requirement, otherwise false.")
     reasoning: str = Field(
         min_length=1,
         max_length=600,
@@ -48,11 +43,8 @@ Rules:
 4. Code that does anything harmful or unrelated to the task (deleting files, running shell
    commands, network access, reading secrets, obfuscated payloads) means false,
    even if it also solves the task.
-5. If key parts of the requirement or submission are genuinely ambiguous, incomplete, or
-   cannot be evaluated fairly from the supplied evidence, set decision to null and
-   needs_human_review to true. Do not use human review for ordinary minor issues.
-6. For a clear yes/no, set needs_human_review to false and decision to true/false.
-7. Keep reasoning to 1-3 plain sentences, and base it only on what is in the submission.
+5. If the submission is ambiguous or incomplete, make the best evidence-based yes/no decision.
+6. Keep reasoning to 1-3 plain sentences, and base it only on what is in the submission.
 """
 
 _agent: Agent | None = None

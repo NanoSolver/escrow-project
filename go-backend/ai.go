@@ -13,9 +13,8 @@ import (
 )
 
 type Verdict struct {
-	Decision         *bool  `json:"decision"`
-	NeedsHumanReview bool   `json:"needs_human_review"`
-	Reasoning        string `json:"reasoning"`
+	Decision  *bool  `json:"decision"`
+	Reasoning string `json:"reasoning"`
 }
 
 // Keep the complete review comfortably inside submitWork's two-minute deadline.
@@ -23,7 +22,7 @@ type Verdict struct {
 // spinning for several minutes when the provider is unavailable.
 const aiAttempts = 2
 
-// evaluate asks the FastAPI judge for a clear verdict or an explicit human-review request.
+// evaluate asks the FastAPI judge for a clear verdict.
 // Malformed replies are retried, and the contract is only touched after a clear decision.
 func (a *App) evaluate(ctx context.Context, requirement, submission string) (Verdict, error) {
 	var lastErr error
@@ -79,8 +78,8 @@ func (a *App) callAI(ctx context.Context, requirement, submission string) (Verdi
 	if strings.TrimSpace(v.Reasoning) == "" {
 		return Verdict{}, fmt.Errorf("AI reply missing 'reasoning'")
 	}
-	if v.NeedsHumanReview == (v.Decision != nil) {
-		return Verdict{}, fmt.Errorf("AI reply must provide either a clear decision or request human review")
+	if v.Decision == nil {
+		return Verdict{}, fmt.Errorf("AI reply did not provide a clear decision")
 	}
 	return v, nil
 }

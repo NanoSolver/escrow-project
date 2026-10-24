@@ -12,10 +12,9 @@ import (
 )
 
 type App struct {
-	db               *pgxpool.Pool
-	chain            *Chain
-	aiURL            string
-	humanReviewToken string
+	db    *pgxpool.Pool
+	chain *Chain
+	aiURL string
 }
 
 func mustEnv(k string) string {
@@ -54,11 +53,14 @@ func main() {
 	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS submission_text TEXT`); err != nil {
 		log.Fatalf("db migration (submission_text): %v", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE escrows ADD COLUMN IF NOT EXISTS human_decision BOOLEAN, ADD COLUMN IF NOT EXISTS human_reasoning TEXT`); err != nil {
-		log.Fatalf("db migration (human decision): %v", err)
+	if _, err := pool.Exec(ctx, `UPDATE escrows SET status = 'funded' WHERE status = 'pending_review'`); err != nil {
+		log.Fatalf("db migration (remove pending reviews): %v", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP CONSTRAINT IF EXISTS escrows_status_check, ADD CONSTRAINT escrows_status_check CHECK (status IN ('created', 'funded', 'evaluating', 'pending_review', 'released', 'refunded'))`); err != nil {
-		log.Fatalf("db migration (pending_review status): %v", err)
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP CONSTRAINT IF EXISTS escrows_status_check, ADD CONSTRAINT escrows_status_check CHECK (status IN ('created', 'funded', 'evaluating', 'released', 'refunded'))`); err != nil {
+		log.Fatalf("db migration (status): %v", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE escrows DROP COLUMN IF EXISTS human_decision, DROP COLUMN IF EXISTS human_reasoning`); err != nil {
+		log.Fatalf("db migration (remove reviewer data): %v", err)
 	}
 
 	chain, err := NewChain(ctx, mustEnv("RPC_URL"), mustEnv("ORACLE_PRIVATE_KEY"))
@@ -68,10 +70,9 @@ func main() {
 	log.Printf("oracle address: %s | chain id: %s", chain.addr.Hex(), chain.chainID)
 
 	app := &App{
-		db:               pool,
-		chain:            chain,
-		aiURL:            envOr("AI_URL", "http://localhost:8000/evaluate"),
-		humanReviewToken: envOr("HUMAN_REVIEW_TOKEN", ""),
+		db:    pool,
+		chain: chain,
+		aiURL: envOr("AI_URL", "http://localhost:8000/evaluate"),
 	}
 
 	app.reconcile(ctx) // local chain only: drop DB rows whose contracts vanished with an Anvil restart
@@ -80,11 +81,11 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "oracle": chain.addr.Hex()})
 	})
+	mux.HandleFunc("POST /auth/challenge", app.authChallenge)
+	mux.HandleFunc("POST /auth/verify", app.authVerify)
 	mux.HandleFunc("POST /escrows", app.createEscrow)
 	mux.HandleFunc("GET /escrows/{address}", app.getEscrow)
 	mux.HandleFunc("POST /escrows/{address}/submit", app.submitWork)
-	mux.HandleFunc("GET /reviews", app.listReviews)
-	mux.HandleFunc("POST /reviews/{address}/decision", app.decideReview)
 
 	srv := &http.Server{
 		Addr:              ":" + envOr("PORT", "8080"),

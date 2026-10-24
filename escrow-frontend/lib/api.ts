@@ -9,8 +9,6 @@ export type EscrowRecord = {
   status: string;
   ai_decision: boolean | null;
   ai_reasoning: string;
-  human_decision: boolean | null;
-  human_reasoning: string;
   tx_hash: string;
   last_error: string;
   deadline_at: string;
@@ -20,7 +18,6 @@ export type EscrowRecord = {
 
 export type SubmitResult = {
   decision: boolean | null;
-  needs_human_review?: boolean;
   reasoning: string;
   status: string;
   tx_hash: string;
@@ -45,6 +42,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => req<{ ok: boolean; oracle: string }>("/health"),
+
+  authChallenge: (address: string, role: "client" | "freelancer") =>
+    req<{ message: string }>("/auth/challenge", { method: "POST", body: JSON.stringify({ address, role }) }),
+
+  authVerify: (address: string, role: "client" | "freelancer", message: string, signature: string) =>
+    req<{ address: string; role: "client" | "freelancer" }>("/auth/verify", {
+      method: "POST", body: JSON.stringify({ address, role, message, signature }),
+    }),
 
   register: (contract_address: string, initial_prompt: string) =>
     req<EscrowRecord>("/escrows", {
@@ -73,26 +78,4 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  reviews: (token: string) =>
-    req<{ reviews: HumanReview[] }>("/reviews", {
-      headers: { Authorization: `Bearer ${token}` },
-    }),
-
-  decideReview: (address: string, token: string, decision: boolean, reasoning: string) =>
-    req<SubmitResult>(`/reviews/${address}/decision`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ decision, reasoning }),
-    }),
-};
-
-export type HumanReview = {
-  contract_address: string;
-  client_address: string;
-  freelancer_address: string;
-  requirement: string;
-  submission_link: string;
-  submission: string;
-  ai_reasoning: string;
-  submitted_at: string;
 };

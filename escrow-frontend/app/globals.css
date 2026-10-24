@@ -107,3 +107,10 @@ dd { margin: 2px 0 0; word-break: break-word; }
 .pill.funded { background: #9e6a03; }
 .pill.released { background: var(--ok); }
 .pill.refunded { background: var(--bad); }
+.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.auth-card { width: min(100%, 440px); padding: 32px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel, #161b22); text-align: center; }
+.auth-card h1 { margin: 4px 0; }
+.auth-card > button { width: 100%; }
+.auth-card .toggle { margin: 24px 0; }
+.brand-mark { width: 48px; height: 48px; display: grid; place-items: center; margin: 0 auto 18px; border-radius: 14px; background: var(--accent); color: white; font-weight: 800; }
+.eyebrow { margin: 0; color: var(--muted); font-size: .75rem; letter-spacing: .14em; }
