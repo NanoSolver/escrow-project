@@ -32,7 +32,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -365,8 +365,9 @@ func (a *App) submitWork(w http.ResponseWriter, r *http.Request) {
 
 	// Atomically claim the escrow so two concurrent submits can't both trigger a settlement.
 	tag, err := a.db.Exec(ctx,
-		`UPDATE escrows SET status = 'evaluating', submission_link = $2, last_error = NULL, updated_at = now()
-		 WHERE contract_address = $1 AND status IN ('created', 'funded')`, addrLower, link)
+		`UPDATE escrows SET status = 'evaluating', submission_link = $2, submission_text = $3, submitted_at = now(),
+		        ai_decision = NULL, ai_reasoning = NULL, last_error = NULL, updated_at = now()
+		 WHERE contract_address = $1 AND status IN ('created', 'funded')`, addrLower, link, submission)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "db error")
 		return
@@ -560,4 +561,134 @@ func (a *App) listOpenEscrows(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+// ───────────────────── submission review (client & freelancer only) ─────────────────────
+
+// GET /escrows/{address}/submission  (Authorization: Bearer <session token>)
+// The submitted work is private: only the escrow's client and its freelancer may read it.
+func (a *App) getSubmission(w http.ResponseWriter, r *http.Request) {
+	_, addrLower, ok := parseAddress(r.PathValue("address"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid address")
+		return
+	}
+	who, ok := requireSession(w, r)
+	if !ok {
+		return
+	}
+	e, err := a.loadEscrow(r.Context(), addrLower)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeErr(w, http.StatusNotFound, "escrow not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	if who != e.ClientAddress && (e.FreelancerAddress == "" || who != e.FreelancerAddress) {
+		writeErr(w, http.StatusForbidden, "only this escrow's client or freelancer can view the submitted work")
+		return
+	}
+	var text string
+	var submittedAt *time.Time
+	if err := a.db.QueryRow(r.Context(),
+		`SELECT COALESCE(submission_text, ''), submitted_at FROM escrows WHERE contract_address = $1`,
+		addrLower).Scan(&text, &submittedAt); err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"submission_link": e.SubmissionLink,
+		"submission_text": text,
+		"submitted_at":    submittedAt,
+		"status":          e.Status,
+		"ai_decision":     e.AIDecision,
+		"ai_reasoning":    e.AIReasoning,
+		"revisions_used":  e.RevisionsUsed,
+		"revision_limit":  e.RevisionLimit,
+	})
+}
+
+// GET /clients/{address}/escrows  (Authorization: Bearer <session token>)
+// The client's own escrows for the review portal. Settled-on-chain states are synced here, so an
+// approval made straight from the wallet shows up without a manual refresh.
+func (a *App) listClientEscrows(w http.ResponseWriter, r *http.Request) {
+	_, addrLower, ok := parseAddress(r.PathValue("address"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "invalid address")
+		return
+	}
+	who, ok := requireSession(w, r)
+	if !ok {
+		return
+	}
+	if who != addrLower {
+		writeErr(w, http.StatusForbidden, "you can only list your own escrows")
+		return
+	}
+	ctx := r.Context()
+
+	rows, err := a.db.Query(ctx, `SELECT `+escrowCols+` FROM escrows WHERE client_address = $1
+		ORDER BY created_at DESC LIMIT 50`, addrLower)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	var list []Escrow
+	for rows.Next() {
+		e, err := scanEscrow(rows)
+		if err != nil {
+			rows.Close()
+			writeErr(w, http.StatusInternalServerError, "db error")
+			return
+		}
+		list = append(list, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+
+	submitted := map[string]time.Time{}
+	if srows, err := a.db.Query(ctx, `SELECT contract_address, submitted_at FROM escrows
+		WHERE client_address = $1 AND submission_text IS NOT NULL AND submission_text <> ''
+		  AND submitted_at IS NOT NULL`, addrLower); err == nil {
+		for srows.Next() {
+			var addr string
+			var at time.Time
+			if srows.Scan(&addr, &at) == nil {
+				submitted[addr] = at
+			}
+		}
+		srows.Close()
+	}
+
+	type item struct {
+		Escrow
+		HasSubmission bool       `json:"has_submission"`
+		SubmittedAt   *time.Time `json:"submitted_at"`
+	}
+	out := make([]item, 0, len(list))
+	for _, e := range list {
+		if e.Status == "created" || e.Status == "funded" || e.Status == "evaluating" {
+			if s, err := a.chain.StatusOf(ctx, common.HexToAddress(e.ContractAddress)); err == nil &&
+				(s == chainReleased || s == chainRefunded) {
+				name := statusName(s)
+				if _, err := a.db.Exec(ctx,
+					`UPDATE escrows SET status = $2, updated_at = now() WHERE contract_address = $1`,
+					e.ContractAddress, name); err == nil {
+					e.Status = name
+				}
+			}
+		}
+		it := item{Escrow: e}
+		if at, ok := submitted[e.ContractAddress]; ok {
+			it.HasSubmission = true
+			it.SubmittedAt = &at
+		}
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"escrows": out})
 }

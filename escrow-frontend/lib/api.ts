@@ -37,6 +37,24 @@ export type OpenJob = {
   created_at: string;
 };
 
+// One row of the client's review portal.
+export type ClientEscrow = EscrowRecord & {
+  has_submission: boolean;
+  submitted_at: string | null;
+};
+
+// The latest submitted work (only the escrow's client and freelancer may fetch it).
+export type SubmissionView = {
+  submission_link: string; // "inline-text" when it was pasted instead of linked
+  submission_text: string;
+  submitted_at: string | null;
+  status: string;
+  ai_decision: boolean | null;
+  ai_reasoning: string;
+  revisions_used: number;
+  revision_limit: number;
+};
+
 export type EscrowDetails = {
   escrow: EscrowRecord;
   chain_status?: string;
@@ -47,12 +65,15 @@ export type EscrowDetails = {
   chain_revisions_used?: number;
 };
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+async function req<T>(path: string, init?: RequestInit, token?: string): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${BACKEND_URL}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
     });
   } catch {
     throw new Error(`Cannot reach the backend at ${BACKEND_URL}. Is the Go server running?`);
@@ -72,7 +93,7 @@ export const api = {
     }),
 
   authVerify: (address: string, role: "client" | "freelancer", message: string, signature: string) =>
-    req<{ address: string; role: "client" | "freelancer" }>("/auth/verify", {
+    req<{ address: string; role: "client" | "freelancer"; token: string }>("/auth/verify", {
       method: "POST",
       body: JSON.stringify({ address, role, message, signature }),
     }),
@@ -87,10 +108,14 @@ export const api = {
 
   openJobs: () => req<{ jobs: OpenJob[] }>("/escrows"),
 
-  submit: (
-    address: string,
-    body: { freelancer: string; submission_link?: string; submission_text?: string },
-  ) =>
+  // Both need the session token returned by sign-in.
+  clientEscrows: (address: string, token: string) =>
+    req<{ escrows: ClientEscrow[] }>(`/clients/${address}/escrows`, undefined, token),
+
+  submission: (address: string, token: string) =>
+    req<SubmissionView>(`/escrows/${address}/submission`, undefined, token),
+
+  submit: (address: string, body: { freelancer: string; submission_link?: string; submission_text?: string }) =>
     req<SubmitResult>(`/escrows/${address}/submit`, {
       method: "POST",
       body: JSON.stringify(body),

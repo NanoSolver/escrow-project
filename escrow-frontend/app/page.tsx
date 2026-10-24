@@ -2,12 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { formatEther, isAddress, parseEther, zeroAddress, type Address, type EIP1193Provider } from "viem";
-import { api, type OpenJob, type SubmitResult } from "../lib/api";
+import { api, type ClientEscrow, type OpenJob, type SubmissionView, type SubmitResult } from "../lib/api";
 import { CHAIN, EXPLORER_TX, SETTLEMENT_GRACE_SECONDS } from "../lib/config";
 import { escrowAbi, escrowBytecode } from "../lib/escrow";
 import { connect } from "../lib/wallet";
 
-type Tab = "client" | "freelancer" | "track";
+type Tab = "client" | "review" | "freelancer" | "track";
+type Identity = { address: string; role: "client" | "freelancer"; token?: string };
 type StepState = "todo" | "active" | "done" | "error";
 type Step = { label: string; state: StepState };
 
@@ -611,6 +612,236 @@ function FreelancerView({ initial, onAccount }: { initial: string; onAccount: (a
   );
 }
 
+/* ─────────────────────── Review & approve (client) ─────────────────────── */
+
+function approveErrMsg(e: unknown): string {
+  const m = errMsg(e);
+  if (m.includes("NotClient"))
+    return "Only the client who created this escrow can approve it. Switch MetaMask to that account.";
+  if (m.includes("DeadlinePassed")) return "The deadline has passed, so the client can no longer approve this escrow.";
+  if (m.includes("NoFreelancer")) return "No freelancer has accepted this open job yet, so there is nobody to pay.";
+  if (m.includes("InvalidStatus"))
+    return "This escrow is not funded any more (it may already be released or refunded).";
+  return m;
+}
+
+const SAFE_LINK = /^https:\/\/(raw|gist)\.githubusercontent\.com\//;
+
+/** The latest submitted work for one escrow. Fetched with the sign-in token; shown as plain text. */
+function SubmissionPanel({
+  address,
+  token,
+  submittedAt,
+}: {
+  address: string;
+  token: string;
+  submittedAt: string | null;
+}) {
+  const [sub, setSub] = useState<SubmissionView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let stop = false;
+    setSub(null);
+    setError(null);
+    api
+      .submission(address, token)
+      .then((d) => {
+        if (!stop) setSub(d);
+      })
+      .catch((e) => {
+        if (!stop) setError(errMsg(e));
+      });
+    return () => {
+      stop = true;
+    };
+  }, [address, token, submittedAt]); // a newer submission reloads the panel
+
+  if (error) return <p className="error">{error}</p>;
+  if (!sub) return <p className="muted small">Loading the submitted work…</p>;
+  const verdict =
+    sub.status === "evaluating"
+      ? "The AI is reviewing this right now."
+      : sub.ai_decision === true
+        ? "AI verdict: approved."
+        : sub.ai_decision === false
+          ? "AI verdict: rejected."
+          : "No AI verdict recorded for this submission.";
+  return (
+    <div className="submission-panel">
+      <p className="muted small">
+        Submitted {sub.submitted_at ? new Date(sub.submitted_at).toLocaleString() : "(time unknown)"} · revisions used{" "}
+        {sub.revisions_used} of {sub.revision_limit}
+      </p>
+      {SAFE_LINK.test(sub.submission_link) && (
+        <p className="small">
+          Source:{" "}
+          <a href={sub.submission_link} target="_blank" rel="noreferrer noopener">
+            {sub.submission_link}
+          </a>
+        </p>
+      )}
+      <pre className="review-submission">{sub.submission_text || "(empty submission)"}</pre>
+      <p className="small">
+        <strong>{verdict}</strong> {sub.ai_reasoning}
+      </p>
+    </div>
+  );
+}
+
+/** The client's portal: read what the freelancer submitted, then approve to release the funds. */
+function ReviewView({ identity, onAccount }: { identity: Identity; onAccount: (a: string) => void }) {
+  const [items, setItems] = useState<ClientEscrow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; tx: string } | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  const token = identity.token;
+
+  useEffect(() => {
+    if (!token) {
+      setError("Your sign-in predates the review portal. Sign out (top right) and sign in again.");
+      return;
+    }
+    let stop = false;
+    const load = async () => {
+      try {
+        const d = await api.clientEscrows(identity.address, token);
+        if (!stop) {
+          setItems(d.escrows);
+          setError(null);
+        }
+      } catch (e) {
+        if (!stop) setError(errMsg(e));
+      }
+    };
+    load();
+    const t = setInterval(load, 10000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [identity.address, token, tick]);
+
+  /** Why approval is not possible right now, or null when it is. */
+  function blocker(it: ClientEscrow): string | null {
+    if (it.status === "released") return "Already released to the freelancer.";
+    if (it.status === "refunded") return "Refunded to you.";
+    if (it.status === "evaluating") return "The AI review is in progress.";
+    if (it.status !== "funded") return "This escrow is not funded.";
+    if (!it.freelancer_address) return "Waiting for a freelancer to accept this open job.";
+    if (!it.has_submission) return "Waiting for the freelancer to submit work.";
+    return null;
+  }
+
+  async function approve(it: ClientEscrow) {
+    setError(null);
+    setNotice(null);
+    setBusy(it.contract_address);
+    try {
+      const w = await connect();
+      onAccount(w.account);
+      if (w.account.toLowerCase() !== identity.address.toLowerCase()) {
+        throw new Error(
+          `MetaMask is on a different account than the one you signed in with. Switch to ${identity.address}.`,
+        );
+      }
+      // Re-check against the chain right before sending, using the chain's own clock.
+      const [live, block] = await Promise.all([api.get(it.contract_address), w.publicClient.getBlock()]);
+      if (live.chain_status !== "funded") throw new Error("This escrow is no longer funded on-chain.");
+      if (!live.chain_freelancer) throw new Error("No freelancer has accepted this job yet.");
+      if (live.chain_deadline !== undefined && block.timestamp >= BigInt(live.chain_deadline)) {
+        throw new Error("The deadline has passed, so the client can no longer approve this escrow.");
+      }
+      const price = live.chain_amount_wei
+        ? `${formatEther(BigInt(live.chain_amount_wei))} ${CHAIN.nativeCurrency.symbol}`
+        : "the escrowed funds";
+      if (
+        !window.confirm(`Release ${price} to ${live.chain_freelancer}? This sends a transaction and cannot be undone.`)
+      )
+        return;
+
+      const hash = await w.walletClient.writeContract({
+        address: it.contract_address as Address,
+        abi: escrowAbi,
+        functionName: "approveByClient",
+        account: w.account,
+        chain: CHAIN,
+      });
+      await w.publicClient.waitForTransactionReceipt({ hash });
+      await api.get(it.contract_address); // lets the backend record the new status
+      setNotice({ text: `Approved: ${price} released to the freelancer.`, tx: hash });
+    } catch (e) {
+      setError(approveErrMsg(e));
+    } finally {
+      setBusy(null);
+      setTick((n) => n + 1);
+    }
+  }
+
+  return (
+    <section className="card">
+      <h2>Review &amp; approve</h2>
+      <p className="muted">
+        Read what the freelancer submitted and release the funds yourself. You can approve work the AI rejected, or
+        confirm work it approved. Approving is a transaction from your wallet, and it is only possible before the
+        deadline.
+      </p>
+      {error && <p className="error">{error}</p>}
+      {notice && (
+        <div className="result ok">
+          <strong>{notice.text}</strong>
+          <p>
+            Transaction: <TxLink hash={notice.tx} />
+          </p>
+        </div>
+      )}
+      {items === null && !error && <p className="muted small">Loading your escrows…</p>}
+      {items?.length === 0 && <p className="muted small">You have not created any escrows yet.</p>}
+      {items?.map((it) => {
+        const why = blocker(it);
+        const isOpen = open === it.contract_address;
+        return (
+          <article className="job" key={it.contract_address}>
+            <div className="job-head">
+              <span>
+                <code>{shortAddr(it.contract_address)}</code> <span className={`pill ${it.status}`}>{it.status}</span>
+              </span>
+              <span className="muted small">
+                {it.freelancer_address
+                  ? `freelancer ${shortAddr(it.freelancer_address)}`
+                  : "open job, not accepted yet"}
+                {it.submitted_at ? ` · submitted ${new Date(it.submitted_at).toLocaleString()}` : ""}
+              </span>
+            </div>
+            <p className="job-req">{it.initial_prompt}</p>
+            <div className="toggle">
+              <button
+                onClick={() => setOpen(isOpen ? null : it.contract_address)}
+                disabled={!it.has_submission}
+                title={it.has_submission ? "" : "Nothing submitted yet"}
+              >
+                {isOpen ? "Hide submission" : it.has_submission ? "View submission" : "No submission yet"}
+              </button>
+              <button onClick={() => approve(it)} disabled={why !== null || busy !== null}>
+                {busy === it.contract_address ? "Confirm in MetaMask…" : "Approve & release funds"}
+              </button>
+            </div>
+            {why && <p className="muted small">{why}</p>}
+            {isOpen && token && (
+              <SubmissionPanel address={it.contract_address} token={token} submittedAt={it.submitted_at} />
+            )}
+          </article>
+        );
+      })}
+      <button className="ghost" onClick={() => setTick((n) => n + 1)} disabled={busy !== null}>
+        Refresh
+      </button>
+    </section>
+  );
+}
+
 /* ───────────────────────────── Track ───────────────────────────── */
 
 function TrackView({ initial }: { initial: string }) {
@@ -775,7 +1006,7 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("client");
   const [account, setAccount] = useState<string | null>(null);
   const [prefill, setPrefill] = useState("");
-  const [identity, setIdentity] = useState<{ address: string; role: "client" | "freelancer" } | null>(null);
+  const [identity, setIdentity] = useState<Identity | null>(null);
   const [hasMetaMask, setHasMetaMask] = useState(false);
   const [pendingWallet, setPendingWallet] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
@@ -785,8 +1016,14 @@ export default function Home() {
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem("escrow.identity");
-      if (saved) setIdentity(JSON.parse(saved));
-    } catch { window.localStorage.removeItem("escrow.identity"); }
+      if (saved) {
+        const parsed = JSON.parse(saved) as Identity;
+        setIdentity(parsed);
+        setTab(parsed.role); // a saved freelancer must not land on the (empty) client tab
+      }
+    } catch {
+      window.localStorage.removeItem("escrow.identity");
+    }
   }, []);
 
   useEffect(() => {
@@ -823,64 +1060,98 @@ export default function Home() {
   }, [identity, pendingWallet]);
 
   async function connectForSignIn() {
-    setAuthError(""); setAuthBusy(true);
+    setAuthError("");
+    setAuthBusy(true);
     try {
       const wallet = await connect();
       signInWallet.current = wallet;
       setPendingWallet(wallet.account);
       setAccount(wallet.account);
-    } catch (e) { setAuthError(walletError(e)); }
-    finally { setAuthBusy(false); }
+    } catch (e) {
+      setAuthError(walletError(e));
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
   async function signIn(role: "client" | "freelancer") {
-    setAuthError(""); setAuthBusy(true);
+    setAuthError("");
+    setAuthBusy(true);
     try {
-      const wallet = signInWallet.current ?? await connect();
+      const wallet = signInWallet.current ?? (await connect());
       if (pendingWallet && wallet.account.toLowerCase() !== pendingWallet.toLowerCase()) {
         throw new Error("The connected MetaMask account changed. Connect the intended account and try again.");
       }
       const challenge = await api.authChallenge(wallet.account, role);
       const signature = await wallet.walletClient.signMessage({ account: wallet.account, message: challenge.message });
       const verified = await api.authVerify(wallet.account, role, challenge.message, signature);
-      const next = { address: verified.address, role: verified.role };
-      setIdentity(next); setAccount(verified.address); setTab(role);
+      const next: Identity = { address: verified.address, role: verified.role, token: verified.token };
+      setIdentity(next);
+      setAccount(verified.address);
+      setTab(role);
       window.localStorage.setItem("escrow.identity", JSON.stringify(next));
-      signInWallet.current = null; setPendingWallet(null);
-    } catch (e) { setAuthError(walletError(e)); }
-    finally { setAuthBusy(false); }
+      signInWallet.current = null;
+      setPendingWallet(null);
+    } catch (e) {
+      setAuthError(walletError(e));
+    } finally {
+      setAuthBusy(false);
+    }
   }
 
-  if (!identity) return <main className="auth-shell">
-    <section className="auth-card">
-      <div className="brand-mark">AE</div>
-      <p className="eyebrow">SECURE WEB3 WORK</p>
-      <h1>AI Escrow</h1>
-      <p className="muted">Fair freelance work, protected on-chain.</p>
-      <div className={`setup-note ${hasMetaMask ? "ready" : ""}`}>
-        <strong>{hasMetaMask ? "MetaMask detected" : "Before you start"}</strong>
-        <ol>
-          <li><a href="https://metamask.io/download/" target="_blank" rel="noreferrer">Install the MetaMask browser extension</a>.</li>
-          <li>Open MetaMask and create a wallet or import your existing one.</li>
-          <li>Come back here and sign in with that wallet.</li>
-        </ol>
-        <p className="muted small">Never share your recovery phrase or private key with this site.</p>
-      </div>
-      {!pendingWallet ? (
-        hasMetaMask ? <button disabled={authBusy} onClick={connectForSignIn}>{authBusy ? "Connecting…" : "Sign in with MetaMask"}</button> :
-          <a className="button-link" href="https://metamask.io/download/" target="_blank" rel="noreferrer">Get MetaMask</a>
-      ) : (
-        <>
-          <p className="muted small">Connected wallet: <code>{shortAddr(pendingWallet)}</code>. Choose your role to finish signing in.</p>
-          <button disabled={authBusy} onClick={() => signIn("client")}>{authBusy ? "Verifying signature…" : "Continue as client"}</button>
-          <button className="ghost" disabled={authBusy} onClick={() => signIn("freelancer")}>Continue as freelancer</button>
-        </>
-      )}
-      <p className="muted small">Signing a one-time message verifies your wallet. It sends no transaction and costs no gas.</p>
-      {authError && <p className="error">{authError}</p>}
-      <p className="muted small">Network: {CHAIN.name}. MetaMask will prompt you to add it if needed.</p>
-    </section>
-  </main>;
+  if (!identity)
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <div className="brand-mark">AE</div>
+          <p className="eyebrow">SECURE WEB3 WORK</p>
+          <h1>AI Escrow</h1>
+          <p className="muted">Fair freelance work, protected on-chain.</p>
+          <div className={`setup-note ${hasMetaMask ? "ready" : ""}`}>
+            <strong>{hasMetaMask ? "MetaMask detected" : "Before you start"}</strong>
+            <ol>
+              <li>
+                <a href="https://metamask.io/download/" target="_blank" rel="noreferrer">
+                  Install the MetaMask browser extension
+                </a>
+                .
+              </li>
+              <li>Open MetaMask and create a wallet or import your existing one.</li>
+              <li>Come back here and sign in with that wallet.</li>
+            </ol>
+            <p className="muted small">Never share your recovery phrase or private key with this site.</p>
+          </div>
+          {!pendingWallet ? (
+            hasMetaMask ? (
+              <button disabled={authBusy} onClick={connectForSignIn}>
+                {authBusy ? "Connecting…" : "Sign in with MetaMask"}
+              </button>
+            ) : (
+              <a className="button-link" href="https://metamask.io/download/" target="_blank" rel="noreferrer">
+                Get MetaMask
+              </a>
+            )
+          ) : (
+            <>
+              <p className="muted small">
+                Connected wallet: <code>{shortAddr(pendingWallet)}</code>. Choose your role to finish signing in.
+              </p>
+              <button disabled={authBusy} onClick={() => signIn("client")}>
+                {authBusy ? "Verifying signature…" : "Continue as client"}
+              </button>
+              <button className="ghost" disabled={authBusy} onClick={() => signIn("freelancer")}>
+                Continue as freelancer
+              </button>
+            </>
+          )}
+          <p className="muted small">
+            Signing a one-time message verifies your wallet. It sends no transaction and costs no gas.
+          </p>
+          {authError && <p className="error">{authError}</p>}
+          <p className="muted small">Network: {CHAIN.name}. MetaMask will prompt you to add it if needed.</p>
+        </section>
+      </main>
+    );
 
   return (
     <main>
@@ -889,7 +1160,15 @@ export default function Home() {
           <h1>AI Escrow</h1>
           <span className="muted small">Funds locked on-chain · released by AI verdict · {CHAIN.name}</span>
         </div>
-        <button className="ghost" onClick={() => { setIdentity(null); window.localStorage.removeItem("escrow.identity"); }}>{shortAddr(identity.address)} · Sign out</button>
+        <button
+          className="ghost"
+          onClick={() => {
+            setIdentity(null);
+            window.localStorage.removeItem("escrow.identity");
+          }}
+        >
+          {shortAddr(identity.address)} · Sign out
+        </button>
       </header>
 
       {account && (
@@ -900,10 +1179,16 @@ export default function Home() {
 
       <nav className="tabs">
         {(
-          [
-            [identity.role, identity.role === "client" ? "Client dashboard" : "Freelancer dashboard"],
-            ["track", "Track escrow"],
-          ] as const
+          (identity.role === "client"
+            ? [
+                ["client", "Create escrow"],
+                ["review", "Review & approve"],
+                ["track", "Track escrow"],
+              ]
+            : [
+                ["freelancer", "Freelancer dashboard"],
+                ["track", "Track escrow"],
+              ]) as [Tab, string][]
         ).map(([id, label]) => (
           <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>
             {label}
@@ -912,7 +1197,10 @@ export default function Home() {
       </nav>
 
       {tab === "client" && identity.role === "client" && <ClientView onAccount={setAccount} />}
-      {tab === "freelancer" && identity.role === "freelancer" && <FreelancerView initial={prefill} onAccount={setAccount} />}
+      {tab === "review" && identity.role === "client" && <ReviewView identity={identity} onAccount={setAccount} />}
+      {tab === "freelancer" && identity.role === "freelancer" && (
+        <FreelancerView initial={prefill} onAccount={setAccount} />
+      )}
       {tab === "track" && <TrackView initial={prefill} />}
     </main>
   );

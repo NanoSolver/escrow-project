@@ -151,6 +151,11 @@ func (c *Chain) callUint64(ctx context.Context, bc *bind.BoundContract, method s
 	return n, nil
 }
 
+// StatusOf reads only the escrow's status: one cheap call for list views.
+func (c *Chain) StatusOf(ctx context.Context, addr common.Address) (uint8, error) {
+	return c.callUint8(ctx, c.bound(addr), "status")
+}
+
 // HasCode reports whether a contract exists at addr on the connected chain.
 func (c *Chain) HasCode(ctx context.Context, addr common.Address) (bool, error) {
 	code, err := c.client.CodeAt(ctx, addr, nil)
