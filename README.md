@@ -1,108 +1,98 @@
-# Escrow Project
+1. Sign in as the client with Anvil account 1.
+2. Create an escrow, choose a freelancer or make it open, set the amount/deadline/revision limit, and fund it.
+3. Sign out and sign in as the freelancer with Anvil account 2.
+4. Accept the open job (if applicable) and submit code or a link.
+5. The API sends the requirement and submission to the AI service. The primary model and independent reviewers evaluate it.
+6. Return to the client view to inspect the result and approve payment if appropriate.
 
-An escrow system where an AI makes the call on who gets paid, and a small panel of other AIs checks its work before anything moves.
+No separate manual contract deployment is needed for this flow: the client page deploys the escrow contract through MetaMask and then deposits the funds.
 
-Escrow is really just a trust problem: two people don't trust each other, so a third party holds the money until the deal is done. This project swaps that third party for smart contracts plus an AI decision layer. One model makes the decision. Three independent "judge" models review it. If the judges don't agree, the first model has to go back and think again.
+## Contract artifact
 
-## How it works
+The frontend uses the checked-in artifact at **escrow-frontend/lib/Escrow.json**. If you change **src/Escrow.sol**, rebuild and copy the new artifact before running the frontend:
 
-1. **A deal is created on-chain.** Funds get locked in the escrow contract.
-2. **A decision is needed.** Did the seller deliver? Should the buyer get a refund? The AI service looks at the situation and makes a call using a model on OpenRouter.
-3. **The judges weigh in.** That decision goes to three separate reviewers: Groq, SambaNova, and Nvidia NIM. Each one votes to approve or reject.
-4. **Two out of three wins.** If at least 2 judges approve, the decision goes through. If not, the OpenRouter model reconsiders and the cycle repeats.
-5. **The contract settles.** Once a decision passes, the backend sends it on-chain and the funds are released.
+### Windows PowerShell
 
-The idea behind using three different providers is simple: no single model gets the final word, and they're less likely to all make the same mistake at the same time.
-
-## What's in the repo
-
-```
-.
-├── src/          Solidity contracts (the escrow itself)
-├── test/         Foundry tests for the contracts
-├── script/       Deployment scripts (DeployEscrow.s.sol)
-├── go-backend/   Go service that connects the chain and the AI
-├── ai-service/   The decision model + the 3-judge consensus layer
-├── lib/          Dependencies (git submodules)
-└── env.example   Template for your API keys and config
+```powershell
+forge build
+Copy-Item .\out\Escrow.sol\Escrow.json .\escrow-frontend\lib\Escrow.json
 ```
 
-The `out/`, `cache/`, and `broadcast/` folders are build and deployment output from Foundry.
-
-## Getting started
-
-### What you'll need
-
-- [Foundry](https://book.getfoundry.sh/getting-started/installation) for the contracts
-- [Go](https://go.dev/dl/) for the backend
-- API keys for:
-  - [OpenRouter](https://openrouter.ai/) (the decision-maker)
-  - [Groq](https://groq.com/), [SambaNova](https://sambanova.ai/), and [Nvidia NIM](https://build.nvidia.com/) (the judges, all of which have free tiers)
-
-### Setup
-
-```bash
-# Clone with submodules so the contract libraries come along
-git clone --recurse-submodules https://github.com/d-luigi/escrow-project.git
-cd escrow-project
-
-# Set up your environment
-cp env.example .env
-# Open .env and fill in your keys
-```
-
-### Build and test the contracts
+### macOS or Linux
 
 ```bash
 forge build
+cp out/Escrow.sol/Escrow.json escrow-frontend/lib/Escrow.json
+```
+
+## Useful checks
+
+From the repository root:
+
+```bash
+cast chain-id --rpc-url http://127.0.0.1:8545
+docker compose -f go-backend/docker-compose.yml ps
+```
+
+The first command should print **31337**. The service health endpoints are:
+
+- Frontend: http://localhost:3000
+- Go API: http://localhost:8080/health
+- AI service: http://localhost:8000/health
+
+Optional project checks:
+
+```bash
 forge test
 ```
 
-### Run it locally
-
-Start a local chain in one terminal:
-
 ```bash
-anvil
+cd go-backend
+go test ./...
 ```
 
-Deploy the contract from another:
+The AI reliability runner makes live model calls and may consume API quota:
 
 ```bash
-forge script script/DeployEscrow.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+cd ai-service
+python run_tests.py
 ```
 
-Then start the backend and the AI service. The exact commands depend on how each one is set up, so check the folders for specifics:
+## Data and safety notes
 
-```bash
-cd go-backend && go run .
-```
+- Anvil is local to one machine. Another developer's Anvil chain, MetaMask network, and PostgreSQL database are separate; local escrow records are not shared between computers.
+- Restarting Anvil creates a fresh local chain. Old contract addresses will not have code on the new chain. Keep the same Anvil process running while using an escrow.
+- PostgreSQL data persists in Docker's named volume. Stopping the database does not delete it. Removing the volume with **docker compose down -v** permanently deletes that local database data.
+- Do not commit **.env** or **.env.local** files, provider keys, or real private keys. Use Anvil keys only for local development.
+- The current setup is intended for local development and demos. The Go API listens on all interfaces by default, and Docker publishes the database port on the host. It uses development database credentials; do not expose it as-is to the public internet.
 
-## Configuration
+## Troubleshooting
 
-Everything lives in `.env`. Copy `env.example` and fill in:
+### MetaMask says the transaction failed
 
-| Variable | What it's for |
-| --- | --- |
-| OpenRouter key | The model that makes the decisions |
-| Groq key | Judge #1 |
-| SambaNova key | Judge #2 |
-| Nvidia NIM key | Judge #3 |
+Check that MetaMask is on **Anvil Local (31337)** and that Anvil is still running at **127.0.0.1:8545**. Check the transaction details in MetaMask's activity view. If Anvil was restarted, contracts deployed in the previous run no longer exist.
 
-Check `env.example` for the exact variable names. And please don't commit your real `.env`. It's already in `.gitignore`, but it's worth double-checking.
+### “No contract deployed at that address on this network”
 
-## Why a judge panel?
+The frontend, MetaMask, and backend must all use the same chain. For this guide, use Anvil chain ID **31337** and RPC **127.0.0.1:8545**. A Sepolia address or an address from an earlier Anvil run will not identify the current local contract.
 
-A single model deciding where money goes is a lot of trust to place in one place. Models can be wrong, confidently so, and sometimes they can be nudged by clever inputs. Having three separate providers review each decision adds a safety net without much extra complexity. The 2-of-3 rule keeps things moving when one judge is having a bad day, while still blocking decisions that most reviewers don't buy.
+### Frontend cannot reach the API
 
-## Status
+Confirm the Go API is running on port **8080** and set **NEXT_PUBLIC_BACKEND_URL=http://127.0.0.1:8080** in **escrow-frontend/.env.local**. Restart the frontend after changing environment variables.
 
-This is a work in progress and hasn't been audited. Please don't put real money through it. Treat it as an experiment.
+### AI review fails or does not finish
 
-## Contributing
+Confirm the AI service is running on port **8000**, the OpenRouter key is valid, and at least two of the three reviewer providers are configured and responding. Rate limits, unavailable models, or invalid keys can prevent a quorum; the system should not settle funds without a valid verdict.
 
-Ideas, bug reports, and pull requests are welcome. Open an issue first if you're planning something big so we can talk it through.
+### PostgreSQL will not start
 
-## License
+Check whether port **5432** is occupied. If it is, use another host port and make the matching port change in **DATABASE_URL**.
 
-No license has been added yet. If you plan to share or reuse this, add one (MIT is a common choice).
+## Development notes
+
+- Solidity contract: **src/Escrow.sol**
+- Deployment script: **script/DeployEscrow.s.sol**
+- Foundry tests: **test/**
+- Go API and database schema: **go-backend/**
+- AI review service: **ai-service/**
+- Next.js client: **escrow-frontend/**
