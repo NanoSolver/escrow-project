@@ -177,7 +177,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
     if (!prompt.trim()) return setError("Describe what the freelancer must deliver.");
 
     setSteps(
-      ["Connect MetaMask", "Deploy escrow contract", "Deposit funds", "Register with backend"].map((label) => ({
+      ["Connect MetaMask", "Check network", "Deploy escrow contract", "Deposit funds", "Register with backend"].map((label) => ({
         label,
         state: "todo" as StepState,
       })),
@@ -195,16 +195,24 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         );
       }
       setParties({ client: w.account, freelancer: isOpen ? zeroAddress : freelancer });
-      const { oracle, chain_id: backendChainId } = await api.health(); // oracle = the Go backend's signing address
-      if (BigInt(backendChainId) !== BigInt(CHAIN.id)) {
-        throw new Error(
-          `Network mismatch: this page is set to ${CHAIN.name} (${CHAIN.id}), but the backend is on chain ${backendChainId}. No escrow was created. Restart the local services and refresh.`,
-        );
-      }
       setStep(0, "done");
 
       current = 1;
       setStep(1, "active");
+      const { oracle, chain_id: backendChainId } = await api.health(); // oracle = the Go backend's signing address
+      const backendChainNumber = Number(backendChainId);
+      if (!Number.isSafeInteger(backendChainNumber) || backendChainNumber <= 0) {
+        throw new Error("The backend did not report its chain ID. Restart the local API and refresh; no escrow was created.");
+      }
+      if (backendChainNumber !== CHAIN.id) {
+        throw new Error(
+          `Network mismatch: this page is set to ${CHAIN.name} (${CHAIN.id}), but the backend is on chain ${backendChainId}. No escrow was created. Restart the local services and refresh.`,
+        );
+      }
+      setStep(1, "done");
+
+      current = 2;
+      setStep(2, "active");
       const value = parseEther(amount);
       // Base the deadline on the chain's clock, so a skewed PC clock can't break it.
       const latestBlock = await w.publicClient.getBlock();
@@ -233,10 +241,10 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         w.publicClient.readContract({ address: addr, abi: escrowAbi, functionName: "freelancer" }),
       ]);
       setParties({ client: String(chainClient), freelancer: String(chainFreelancer) });
-      setStep(1, "done");
+      setStep(2, "done");
 
-      current = 2;
-      setStep(2, "active");
+      current = 3;
+      setStep(3, "active");
       const depositHash = await w.walletClient.writeContract({
         address: addr,
         abi: escrowAbi,
@@ -246,18 +254,18 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         chain: CHAIN,
       });
       await w.publicClient.waitForTransactionReceipt({ hash: depositHash });
-      setStep(2, "done");
+      setStep(3, "done");
       fundedAddress = addr;
       setCreated(addr);
 
-      current = 3;
-      setStep(3, "active");
+      current = 4;
+      setStep(4, "active");
       await registerWithRetry(addr, prompt.trim());
-      setStep(3, "done");
+      setStep(4, "done");
       setPendingRegistration(null);
     } catch (e) {
       setStep(current, "error");
-      if (current === 3 && fundedAddress) {
+      if (current === 4 && fundedAddress) {
         setPendingRegistration({ address: fundedAddress, prompt: prompt.trim() });
         setError(
           `The escrow is funded on-chain, but backend sync did not finish. Do not create another escrow. Contract: ${fundedAddress}`,
@@ -274,13 +282,13 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
     if (!pendingRegistration || busy) return;
     setBusy(true);
     setError(null);
-    setStep(3, "active");
+    setStep(4, "active");
     try {
       await registerWithRetry(pendingRegistration.address, pendingRegistration.prompt);
-      setStep(3, "done");
+      setStep(4, "done");
       setPendingRegistration(null);
     } catch {
-      setStep(3, "error");
+      setStep(4, "error");
       setError(
         `Backend sync is still unavailable. Your funded escrow is safe at ${pendingRegistration.address}. Retry sync later; do not create another escrow.`,
       );
