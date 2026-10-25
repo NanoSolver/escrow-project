@@ -2,13 +2,13 @@
 -- All wallet/contract addresses are stored lowercase.
 -- (An existing database is upgraded automatically by the Go backend at startup.)
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     wallet_address TEXT PRIMARY KEY CHECK (wallet_address ~ '^0x[0-9a-f]{40}$'),
     role           TEXT NOT NULL CHECK (role IN ('client', 'freelancer')),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE escrows (
+CREATE TABLE IF NOT EXISTS escrows (
     id                 BIGSERIAL PRIMARY KEY,
     contract_address   TEXT NOT NULL UNIQUE CHECK (contract_address ~ '^0x[0-9a-f]{40}$'),
     client_address     TEXT NOT NULL REFERENCES users (wallet_address),
@@ -31,5 +31,5 @@ CREATE TABLE escrows (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX escrows_client_idx ON escrows (client_address);
-CREATE INDEX escrows_freelancer_idx ON escrows (freelancer_address);
+CREATE INDEX IF NOT EXISTS escrows_client_idx ON escrows (client_address);
+CREATE INDEX IF NOT EXISTS escrows_freelancer_idx ON escrows (freelancer_address);

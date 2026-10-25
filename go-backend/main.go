@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
+
+//go:embed schema.sql
+var schemaSQL string
 
 type App struct {
 	db    *pgxpool.Pool
@@ -43,6 +48,15 @@ func main() {
 	}
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("db ping: %v", err)
+	}
+	// Create tables and indexes on fresh databases (e.g. Neon), then upgrade older schemas below.
+	for _, stmt := range strings.Split(schemaSQL, ";") {
+		if stmt = strings.TrimSpace(stmt); stmt == "" {
+			continue
+		}
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			log.Fatalf("db schema: %v", err)
+		}
 	}
 	// Upgrade databases created before deadlines/revisions existed (safe to run every start).
 	for _, stmt := range []string{
@@ -83,6 +97,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("chain: %v", err)
 	}
+	if expected := strings.TrimSpace(os.Getenv("EXPECTED_CHAIN_ID")); expected != "" && expected != chain.chainID.String() {
+		log.Fatalf("connected chain ID %s does not match EXPECTED_CHAIN_ID=%s", chain.chainID, expected)
+	}
 	log.Printf("oracle address: %s | chain id: %s", chain.addr.Hex(), chain.chainID)
 	if bal, err := chain.client.BalanceAt(ctx, chain.addr, nil); err == nil {
 		log.Printf("oracle balance: %s wei", bal)
@@ -101,7 +118,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "oracle": chain.addr.Hex()})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"oracle":   chain.addr.Hex(),
+			"chain_id": chain.chainID.String(),
+		})
 	})
 	mux.HandleFunc("POST /auth/challenge", app.authChallenge)
 	mux.HandleFunc("POST /auth/verify", app.authVerify)
