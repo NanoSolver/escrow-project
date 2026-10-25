@@ -15,19 +15,6 @@ type Identity = { address: string; role: "client" | "freelancer"; token?: string
 type StepState = "todo" | "active" | "done" | "error";
 type Step = { label: string; state: StepState };
 
-async function registerWithRetry(address: string, prompt: string) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await api.register(address, prompt);
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 750 * (attempt + 1)));
-    }
-  }
-  throw lastError;
-}
-
 function errMsg(e: unknown): string {
   const x = e as { shortMessage?: string; message?: string };
   return x?.shortMessage ?? x?.message ?? String(e);
@@ -153,7 +140,6 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<string | null>(null);
-  const [pendingRegistration, setPendingRegistration] = useState<{ address: string; prompt: string } | null>(null);
   const [parties, setParties] = useState<{ client: string; freelancer: string } | null>(null);
 
   const setStep = (i: number, state: StepState) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, state } : x)));
@@ -161,7 +147,6 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   async function create() {
     setError(null);
     setCreated(null);
-    setPendingRegistration(null);
     const isOpen = assignment === "open";
     if (!isOpen && !isAddress(freelancer)) return setError("Enter a valid freelancer wallet address.");
     const eth = Number(amount);
@@ -177,14 +162,13 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
     if (!prompt.trim()) return setError("Describe what the freelancer must deliver.");
 
     setSteps(
-      ["Connect MetaMask", "Check network", "Deploy escrow contract", "Deposit funds", "Register with backend"].map((label) => ({
+      ["Connect MetaMask", "Deploy escrow contract", "Deposit funds", "Register with backend"].map((label) => ({
         label,
         state: "todo" as StepState,
       })),
     );
     setBusy(true);
     let current = 0;
-    let fundedAddress: string | null = null;
     try {
       setStep(0, "active");
       const w = await connect();
@@ -195,24 +179,11 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         );
       }
       setParties({ client: w.account, freelancer: isOpen ? zeroAddress : freelancer });
+      const { oracle } = await api.health(); // oracle = the Go backend's signing address
       setStep(0, "done");
 
       current = 1;
       setStep(1, "active");
-      const { oracle, chain_id: backendChainId } = await api.health(); // oracle = the Go backend's signing address
-      const backendChainNumber = Number(backendChainId);
-      if (!Number.isSafeInteger(backendChainNumber) || backendChainNumber <= 0) {
-        throw new Error("The backend did not report its chain ID. Restart the local API and refresh; no escrow was created.");
-      }
-      if (backendChainNumber !== CHAIN.id) {
-        throw new Error(
-          `Network mismatch: this page is set to ${CHAIN.name} (${CHAIN.id}), but the backend is on chain ${backendChainId}. No escrow was created. Restart the local services and refresh.`,
-        );
-      }
-      setStep(1, "done");
-
-      current = 2;
-      setStep(2, "active");
       const value = parseEther(amount);
       // Base the deadline on the chain's clock, so a skewed PC clock can't break it.
       const latestBlock = await w.publicClient.getBlock();
@@ -241,10 +212,10 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         w.publicClient.readContract({ address: addr, abi: escrowAbi, functionName: "freelancer" }),
       ]);
       setParties({ client: String(chainClient), freelancer: String(chainFreelancer) });
-      setStep(2, "done");
+      setStep(1, "done");
 
-      current = 3;
-      setStep(3, "active");
+      current = 2;
+      setStep(2, "active");
       const depositHash = await w.walletClient.writeContract({
         address: addr,
         abi: escrowAbi,
@@ -254,44 +225,17 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         chain: CHAIN,
       });
       await w.publicClient.waitForTransactionReceipt({ hash: depositHash });
-      setStep(3, "done");
-      fundedAddress = addr;
-      setCreated(addr);
+      setStep(2, "done");
 
-      current = 4;
-      setStep(4, "active");
-      await registerWithRetry(addr, prompt.trim());
-      setStep(4, "done");
-      setPendingRegistration(null);
+      current = 3;
+      setStep(3, "active");
+      await api.register(addr, prompt.trim());
+      setStep(3, "done");
+
+      setCreated(addr);
     } catch (e) {
       setStep(current, "error");
-      if (current === 4 && fundedAddress) {
-        setPendingRegistration({ address: fundedAddress, prompt: prompt.trim() });
-        setError(
-          `The escrow is funded on-chain, but backend sync did not finish. Do not create another escrow. Contract: ${fundedAddress}`,
-        );
-      } else {
-        setError(errMsg(e));
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function retryRegistration() {
-    if (!pendingRegistration || busy) return;
-    setBusy(true);
-    setError(null);
-    setStep(4, "active");
-    try {
-      await registerWithRetry(pendingRegistration.address, pendingRegistration.prompt);
-      setStep(4, "done");
-      setPendingRegistration(null);
-    } catch {
-      setStep(4, "error");
-      setError(
-        `Backend sync is still unavailable. Your funded escrow is safe at ${pendingRegistration.address}. Retry sync later; do not create another escrow.`,
-      );
+      setError(errMsg(e));
     } finally {
       setBusy(false);
     }
@@ -354,14 +298,9 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       <label>Requirement (what the AI will judge against)</label>
       <textarea rows={5} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
 
-      <button onClick={create} disabled={busy || !!pendingRegistration}>
+      <button onClick={create} disabled={busy}>
         {busy ? "Working…" : "Create & fund escrow"}
       </button>
-      {pendingRegistration && (
-        <button onClick={retryRegistration} disabled={busy}>
-          {busy ? "Syncing…" : "Retry backend sync"}
-        </button>
-      )}
 
       {steps.length > 0 && <StepList steps={steps} />}
       {parties && (
