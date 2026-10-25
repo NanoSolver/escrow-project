@@ -85,7 +85,7 @@ async function req<T>(path: string, init?: RequestInit, token?: string): Promise
 }
 
 export const api = {
-  health: () => req<{ ok: boolean; oracle: string }>("/health"),
+  health: () => req<{ ok: boolean; oracle: string; chain_id: string }>("/health"),
 
   authChallenge: (address: string, role: "client" | "freelancer") =>
     req<{ message: string }>("/auth/challenge", {

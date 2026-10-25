@@ -15,6 +15,19 @@ type Identity = { address: string; role: "client" | "freelancer"; token?: string
 type StepState = "todo" | "active" | "done" | "error";
 type Step = { label: string; state: StepState };
 
+async function registerWithRetry(address: string, prompt: string) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await api.register(address, prompt);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 750 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
 function errMsg(e: unknown): string {
   const x = e as { shortMessage?: string; message?: string };
   return x?.shortMessage ?? x?.message ?? String(e);
@@ -140,6 +153,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<string | null>(null);
+  const [pendingRegistration, setPendingRegistration] = useState<{ address: string; prompt: string } | null>(null);
   const [parties, setParties] = useState<{ client: string; freelancer: string } | null>(null);
 
   const setStep = (i: number, state: StepState) => setSteps((s) => s.map((x, j) => (j === i ? { ...x, state } : x)));
@@ -147,6 +161,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
   async function create() {
     setError(null);
     setCreated(null);
+    setPendingRegistration(null);
     const isOpen = assignment === "open";
     if (!isOpen && !isAddress(freelancer)) return setError("Enter a valid freelancer wallet address.");
     const eth = Number(amount);
@@ -169,6 +184,7 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
     );
     setBusy(true);
     let current = 0;
+    let fundedAddress: string | null = null;
     try {
       setStep(0, "active");
       const w = await connect();
@@ -179,7 +195,12 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
         );
       }
       setParties({ client: w.account, freelancer: isOpen ? zeroAddress : freelancer });
-      const { oracle } = await api.health(); // oracle = the Go backend's signing address
+      const { oracle, chain_id: backendChainId } = await api.health(); // oracle = the Go backend's signing address
+      if (BigInt(backendChainId) !== BigInt(CHAIN.id)) {
+        throw new Error(
+          `Network mismatch: this page is set to ${CHAIN.name} (${CHAIN.id}), but the backend is on chain ${backendChainId}. No escrow was created. Restart the local services and refresh.`,
+        );
+      }
       setStep(0, "done");
 
       current = 1;
@@ -226,16 +247,43 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       });
       await w.publicClient.waitForTransactionReceipt({ hash: depositHash });
       setStep(2, "done");
+      fundedAddress = addr;
+      setCreated(addr);
 
       current = 3;
       setStep(3, "active");
-      await api.register(addr, prompt.trim());
+      await registerWithRetry(addr, prompt.trim());
       setStep(3, "done");
-
-      setCreated(addr);
+      setPendingRegistration(null);
     } catch (e) {
       setStep(current, "error");
-      setError(errMsg(e));
+      if (current === 3 && fundedAddress) {
+        setPendingRegistration({ address: fundedAddress, prompt: prompt.trim() });
+        setError(
+          `The escrow is funded on-chain, but backend sync did not finish. Do not create another escrow. Contract: ${fundedAddress}`,
+        );
+      } else {
+        setError(errMsg(e));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retryRegistration() {
+    if (!pendingRegistration || busy) return;
+    setBusy(true);
+    setError(null);
+    setStep(3, "active");
+    try {
+      await registerWithRetry(pendingRegistration.address, pendingRegistration.prompt);
+      setStep(3, "done");
+      setPendingRegistration(null);
+    } catch {
+      setStep(3, "error");
+      setError(
+        `Backend sync is still unavailable. Your funded escrow is safe at ${pendingRegistration.address}. Retry sync later; do not create another escrow.`,
+      );
     } finally {
       setBusy(false);
     }
@@ -298,9 +346,14 @@ function ClientView({ onAccount }: { onAccount: (a: string) => void }) {
       <label>Requirement (what the AI will judge against)</label>
       <textarea rows={5} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
 
-      <button onClick={create} disabled={busy}>
+      <button onClick={create} disabled={busy || !!pendingRegistration}>
         {busy ? "Working…" : "Create & fund escrow"}
       </button>
+      {pendingRegistration && (
+        <button onClick={retryRegistration} disabled={busy}>
+          {busy ? "Syncing…" : "Retry backend sync"}
+        </button>
+      )}
 
       {steps.length > 0 && <StepList steps={steps} />}
       {parties && (

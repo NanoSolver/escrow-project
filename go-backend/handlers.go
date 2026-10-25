@@ -140,6 +140,21 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Registration can be retried after a browser/API response is lost. Treat an identical
+	// retry as success so a funded escrow is not stranded behind a duplicate-key error.
+	client := strings.ToLower(info.Client.Hex())
+	if existing, err := a.loadEscrow(ctx, addrLower); err == nil {
+		if existing.ClientAddress != client || existing.InitialPrompt != prompt {
+			writeErr(w, http.StatusConflict, "escrow is already registered with different details")
+			return
+		}
+		writeJSON(w, http.StatusOK, existing)
+		return
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		writeErr(w, http.StatusInternalServerError, "db error")
+		return
+	}
+
 	tx, err := a.db.Begin(ctx)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "db error")
@@ -147,7 +162,6 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	client := strings.ToLower(info.Client.Hex())
 	users := []struct{ addr, role string }{{client, "client"}}
 	// freelancerArg stays nil (SQL NULL) for an open job nobody has accepted yet.
 	var freelancerArg any
