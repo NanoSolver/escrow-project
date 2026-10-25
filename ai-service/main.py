@@ -14,7 +14,7 @@ load_dotenv(override=True)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from evaluator import OPENROUTER_DEFAULT_MODEL, Verdict, evaluate, provider_name
+from evaluator import OPENROUTER_DEFAULT_MODEL, REVIEWERS, Verdict, evaluate, provider_name
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai-judge")
@@ -30,6 +30,15 @@ else:
     log.info("%s loaded", _key_name)
 log.info("provider=%s model=%s", _provider,
          os.getenv("LLM_MODEL", OPENROUTER_DEFAULT_MODEL))
+for _reviewer, _settings in REVIEWERS.items():
+    _key_present = bool((os.getenv(_settings["key"]) or "").strip())
+    if _reviewer == "nvidia_nim":
+        _key_present = _key_present or bool((os.getenv("NVIDIA_API_KEY") or "").strip())
+    if _key_present:
+        log.info("reviewer=%s configured model=%s", _reviewer,
+                 os.getenv(_settings["model_env"], _settings["model"]))
+    else:
+        log.warning("reviewer=%s is not configured; evaluations will fail closed", _reviewer)
 
 
 class EvaluateRequest(BaseModel):

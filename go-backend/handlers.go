@@ -79,18 +79,20 @@ type Escrow struct {
 	RevisionLimit     int       `json:"revision_limit"`
 	RevisionsUsed     int       `json:"revisions_used"`
 	CreatedAt         time.Time `json:"created_at"`
+	AmountWei         string    `json:"amount_wei"` // "" until first read from the chain
 }
 
 const escrowCols = `contract_address, client_address, COALESCE(freelancer_address, ''), initial_prompt,
 	COALESCE(submission_link, ''), status, ai_decision, COALESCE(ai_reasoning, ''),
 	COALESCE(tx_hash, ''), COALESCE(last_error, ''),
-	COALESCE(deadline_at, to_timestamp(0)), revision_limit, revisions_used, created_at`
+	COALESCE(deadline_at, to_timestamp(0)), revision_limit, revisions_used, created_at,
+	COALESCE(amount_wei, '')`
 
 func scanEscrow(row pgx.Row) (Escrow, error) {
 	var e Escrow
 	err := row.Scan(&e.ContractAddress, &e.ClientAddress, &e.FreelancerAddress, &e.InitialPrompt,
 		&e.SubmissionLink, &e.Status, &e.AIDecision, &e.AIReasoning, &e.TxHash, &e.LastError,
-		&e.DeadlineAt, &e.RevisionLimit, &e.RevisionsUsed, &e.CreatedAt)
+		&e.DeadlineAt, &e.RevisionLimit, &e.RevisionsUsed, &e.CreatedAt, &e.AmountWei)
 	return e, err
 }
 
@@ -164,10 +166,11 @@ func (a *App) createEscrow(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO escrows (contract_address, client_address, freelancer_address, initial_prompt, status,
-		                      deadline_at, revision_limit, revisions_used)
-		 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7, $8)`,
+		                      deadline_at, revision_limit, revisions_used, amount_wei)
+		 VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7, $8, $9)`,
 		addrLower, client, freelancerArg, prompt, statusName(info.Status),
-		float64(info.SubmissionDeadline), int(info.RevisionLimit), int(info.RevisionsUsed)); err != nil {
+		float64(info.SubmissionDeadline), int(info.RevisionLimit), int(info.RevisionsUsed),
+		info.Amount.String()); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			writeErr(w, http.StatusConflict, "escrow already registered")
@@ -610,10 +613,19 @@ func (a *App) getSubmission(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /clients/{address}/escrows  (Authorization: Bearer <session token>)
-// The client's own escrows for the review portal. Settled-on-chain states are synced here, so an
-// approval made straight from the wallet shows up without a manual refresh.
+// GET /clients/{address}/escrows and GET /freelancers/{address}/escrows
+// (Authorization: Bearer <session token>). Your own escrows for the review portal and "My jobs".
 func (a *App) listClientEscrows(w http.ResponseWriter, r *http.Request) {
+	a.listMyEscrows(w, r, "client_address")
+}
+
+func (a *App) listFreelancerEscrows(w http.ResponseWriter, r *http.Request) {
+	a.listMyEscrows(w, r, "freelancer_address")
+}
+
+// column is one of two constants above, never user input. Settled-on-chain states are synced here,
+// so an approval or refund made straight from a wallet shows up without a manual refresh.
+func (a *App) listMyEscrows(w http.ResponseWriter, r *http.Request, column string) {
 	_, addrLower, ok := parseAddress(r.PathValue("address"))
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "invalid address")
@@ -629,7 +641,7 @@ func (a *App) listClientEscrows(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	rows, err := a.db.Query(ctx, `SELECT `+escrowCols+` FROM escrows WHERE client_address = $1
+	rows, err := a.db.Query(ctx, `SELECT `+escrowCols+` FROM escrows WHERE `+column+` = $1
 		ORDER BY created_at DESC LIMIT 50`, addrLower)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "db error")
@@ -653,7 +665,7 @@ func (a *App) listClientEscrows(w http.ResponseWriter, r *http.Request) {
 
 	submitted := map[string]time.Time{}
 	if srows, err := a.db.Query(ctx, `SELECT contract_address, submitted_at FROM escrows
-		WHERE client_address = $1 AND submission_text IS NOT NULL AND submission_text <> ''
+		WHERE `+column+` = $1 AND submission_text IS NOT NULL AND submission_text <> ''
 		  AND submitted_at IS NOT NULL`, addrLower); err == nil {
 		for srows.Next() {
 			var addr string
@@ -672,6 +684,14 @@ func (a *App) listClientEscrows(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]item, 0, len(list))
 	for _, e := range list {
+		// Escrows registered before amounts were stored get theirs from the chain, once.
+		if e.AmountWei == "" {
+			if info, err := a.chain.Info(ctx, common.HexToAddress(e.ContractAddress)); err == nil {
+				e.AmountWei = info.Amount.String()
+				_, _ = a.db.Exec(ctx, `UPDATE escrows SET amount_wei = $2 WHERE contract_address = $1`,
+					e.ContractAddress, e.AmountWei)
+			}
+		}
 		if e.Status == "created" || e.Status == "funded" || e.Status == "evaluating" {
 			if s, err := a.chain.StatusOf(ctx, common.HexToAddress(e.ContractAddress)); err == nil &&
 				(s == chainReleased || s == chainRefunded) {
