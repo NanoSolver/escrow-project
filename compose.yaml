@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: trustforge-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: escrow
+      POSTGRES_PASSWORD: escrow
+      POSTGRES_DB: escrow
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - trustforge-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U escrow -d escrow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trustforge-local-api
+    restart: unless-stopped
+    env_file:
+      - ./go-backend/.env
+      - ./ai-service/.env
+    environment:
+      DATABASE_URL: postgres://escrow:escrow@postgres:5432/escrow?sslmode=disable
+      RPC_URL: http://host.docker.internal:8545
+      EXPECTED_CHAIN_ID: "31337"
+      AI_URL: http://127.0.0.1:8001/evaluate
+      PORT: "8080"
+      FRONTEND_ORIGIN: http://localhost:3000
+    ports:
+      - "127.0.0.1:8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  trustforge-postgres-data:

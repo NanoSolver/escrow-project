@@ -17,7 +17,7 @@ COPY ai-service/requirements.txt ./ai-service/requirements.txt
 RUN pip install --no-cache-dir -r ./ai-service/requirements.txt
 COPY ai-service/main.py ai-service/evaluator.py ./ai-service/
 COPY --from=go-build /out/escrow-backend ./escrow-backend
-COPY deploy/start-services.sh ./start-services.sh
+COPY scripts/start-services.sh ./start-services.sh
 COPY go-backend/schema.sql ./schema.sql
 EXPOSE 8080
 CMD ["sh", "./start-services.sh"]
